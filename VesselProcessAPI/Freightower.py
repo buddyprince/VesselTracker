@@ -1,5 +1,4 @@
 ﻿import difflib
-import functools
 import json
 import logging
 import re
@@ -29,70 +28,46 @@ class FreightowerAPI:
         self._http.headers.update({"User-Agent": self._ua, "Accept": "application/json"})
         self._http.headers["Authorization"] = "Bearer " + self._login(force=force)
         self._store = Store()
-        # 内存与磁盘分片一一对应: 键名即 Store.FILES (vessel_info/ais/...),
-        # 值均为 {键: data}; 展示视图统一由 Present 现拼
-        self._items = {key: {} for key in Store.FILES}
-        self._items["vessel_info"] = self._store.load("vessel_info")
         self._mmsi_for_search = []
         self._date_format = "%Y-%m-%d %H:%M:%S"
 
     def delete(self, names: "str | list[str] | tuple[str, ...] | None" = None):
-        """删除存档并同步内存; names=None 清空全部。语义见 :meth:`Store.delete`。"""
+        """删除存档; names=None 清空全部。语义见 :meth:`Store.delete`。"""
         if names is None:
             self._store.delete(None)
-            self._items = {key: {} for key in Store.FILES}
             self._mmsi_for_search = []
             return self
         wanted = {names} if isinstance(names, str) else {str(n) for n in names}
+        on_disk = self._store.load("vessel_info")
         target_mmsis = set()
         for name in wanted:  # 汇总待删船名涉及的 mmsi (含 multiple 的两个候选)
-            rec = self._items["vessel_info"].get(name)
+            rec = on_disk.get(name)
             if isinstance(rec, dict):
                 target_mmsis |= Store._entry_mmsis(rec)
         self._store.delete(wanted)
-        # 内存与磁盘保持一致: 删指定船名 + 引用目标 mmsi 的别名条目
-        for query, rec in list(self._items["vessel_info"].items()):
-            if query in wanted or (target_mmsis
-                                   and target_mmsis & Store._entry_mmsis(rec)):
-                self._items["vessel_info"].pop(query, None)
-        for key in Store.MMSI_KEYED:
-            for m in target_mmsis:
-                self._items[key].pop(m, None)
         self._mmsi_for_search = [
             m for m in self._mmsi_for_search if m not in target_mmsis]
         return self
 
-    def _save_section(section: str):
-        """链式方法装饰器: 读完即存——只把本批 mmsi 的一个数据块 merge 落盘。
+    def _save_batch(self, section: str, batch: dict) -> None:
+        """merge 一批 ``{mmsi: data}`` 落盘; OSError 只告警不打断链式调用。"""
+        if not batch:
+            return
+        try:
+            self._store.save(section, batch)
+        except OSError as e:
+            log.warning(f"结果块 {section} 写入失败: {e}")
 
-        Args:
-            section: 数据块名 (ais/current_port/history_ports/history_route/future_route)。
-        """
-        def decorator(method):
-            @functools.wraps(method)
-            def wrapper(self: "FreightowerAPI", *args, **kwargs):
-                result = method(self, *args, **kwargs)
-                block = self._items[section]
-                vessels = {m: block[m] for m in self._mmsi_for_search if m in block}
-                try:
-                    self._store.save(section, vessels)
-                except OSError as e:
-                    log.warning(f"结果块 {section} 写入失败: {e}")
-                return result
-            return wrapper
-        return decorator
-
-    def _save_vessel_info(method):
-        """船名查询方法装饰器: 读完即把船名结果 merge 进 .vessel_info.json。"""
-        @functools.wraps(method)
-        def wrapper(self: "FreightowerAPI", *args, **kwargs):
-            result = method(self, *args, **kwargs)
-            try:
-                self._store.save("vessel_info", self._items["vessel_info"])
-            except OSError as e:
-                log.warning(f"船名结果写入失败: {e}")
-            return result
-        return wrapper
+    def _save_vessel_info(self, result: dict) -> None:
+        """把磁盘上尚不存在的船名 merge 进 .vessel_info.json, 已有键不覆盖。"""
+        try:
+            on_disk = self._store.load("vessel_info")
+            fresh = {k: v for k, v in (result or {}).items()
+                     if k not in on_disk}
+            if fresh:
+                self._store.save("vessel_info", fresh)
+        except OSError as e:
+            log.warning(f"船名结果写入失败: {e}")
 
 
     def _token_valid(self, token: str) -> bool:
@@ -217,7 +192,6 @@ class FreightowerAPI:
             score += max(0, 30 - int(age_days))  # AIS 越新分越高, 30 天前封顶为 0
         return score
     
-    @_save_vessel_info
     def get_info_by_vessel_name(
         self,
         names: "str | list[str] | tuple[str, ...]",
@@ -241,7 +215,9 @@ class FreightowerAPI:
             loading_country: 并列决胜用, UN/LOCODE 两位国家码 (如 "BR"),
                 可传多个; 仅当打分并列时查近 60 天历史挂靠, 候选曾挂靠任一
                 国家即加 30 分; 若仍并列, 仅在这些装港国命中候选中, 下一港
-                位于东亚/东南亚者再加 20 分。不作过滤, 不传则维持 multiple。
+                位于东亚/东南亚者再加 20 分; 若仍并列, 装港国命中候选的近 60 天
+                挂靠 / 当前靠港 / AIS ETA 目的港任一含中国 (CN) 者再加 20 分。
+                不作过滤, 不传则维持 multiple。
 
         Returns:
             ``{船名: {"status": ..., "info": ...}}``, 顺序与入参一致, 三种情况:
@@ -261,6 +237,7 @@ class FreightowerAPI:
         infos: dict[str, "dict | None"] = {}  # MMSI -> 档案, 同 MMSI 只查一次且跨船复用
         recent_ports: dict = {}  # MMSI -> 近60天挂靠, 并列决胜时才查, 跨船/跨遍缓存
         dest_details: dict = {}  # MMSI -> AIS详情, 二级决胜时才查, 跨船/跨遍缓存
+        current_ports: dict = {}  # MMSI -> 当前挂靠, 三级决胜时才查, 跨船/跨遍缓存
         history_begin = (datetime.now() - timedelta(days=60)).strftime(self._date_format)
 
         for name in name_list:
@@ -331,11 +308,9 @@ class FreightowerAPI:
                 same = [folds[k] for k in order]
                 scores = {c["mmsi"]: self._vessel_score(c, infos[c["mmsi"]]) for c in same}
                 top2 = sorted(scores.values(), reverse=True)[:2]
-                # 并列决胜: 先查近60天历史挂靠, 曾到过任一装港国的候选加 30 分;
-                # 若仍并列, 仅在装港国命中候选中查 AIS 下一港, 东亚/东南亚再加 20 分;
-                # 都不满足或仍并列时维持 multiple
                 if (country_codes is not None and len(top2) > 1
                         and top2[0] - top2[1] <= 15):
+                    # 第四步: 近60天历史挂靠, 到过任一装港国 +30
                     loading_hits = set()
                     for c in same:
                         mmsi = c["mmsi"]
@@ -350,6 +325,7 @@ class FreightowerAPI:
                             scores[mmsi] += 30
                             loading_hits.add(mmsi)
                     top2 = sorted(scores.values(), reverse=True)[:2]
+                    # 第五步: 若仍并列, 装港国命中候选中 AIS 下一港在东亚/东南亚 +20
                     if len(top2) > 1 and top2[0] - top2[1] <= 15:
                         asia_codes = {
                             "CN", "HK", "TW", "JP", "KP", "KR", "MO",
@@ -367,8 +343,43 @@ class FreightowerAPI:
                             if dest_code in asia_codes or dest_suffix in asia_codes:
                                 scores[mmsi] += 20
                         top2 = sorted(scores.values(), reverse=True)[:2]
+                    # 第六步: 若仍并列, 装港国命中候选中近60天挂靠/当前靠港/AIS ETA
+                    # 目的港任一含中国(CN) +20
+                    if len(top2) > 1 and top2[0] - top2[1] <= 15:
+                        for mmsi in loading_hits:
+                            hit_cn = False
+                            # 近60天历史挂靠 (第四步已拉, 复用)
+                            ports = recent_ports.get(mmsi)
+                            if isinstance(ports, list) and any(
+                                    str(p.get("countryCode") or "").strip().upper() == "CN"
+                                    for p in ports if isinstance(p, dict)):
+                                hit_cn = True
+                            # 当前靠港 (按需拉 getCurrentVoyageByMmsi, 跨船缓存)
+                            if not hit_cn:
+                                if mmsi not in current_ports:
+                                    cur = self._get(
+                                        "/vessel2/getCurrentVoyageByMmsi", {"mmsi": mmsi})
+                                    current_ports[mmsi] = (
+                                        cur if isinstance(cur, (list, dict)) else [])
+                                cur = current_ports[mmsi]
+                                rows = (cur if isinstance(cur, list)
+                                        else [cur] if isinstance(cur, dict) else [])
+                                if any(str(r.get("countryCode") or "").strip().upper() == "CN"
+                                       for r in rows if isinstance(r, dict)):
+                                    hit_cn = True
+                            # AIS ETA 目的港 (第五步已拉 dest_details, 复用)
+                            if not hit_cn:
+                                ais = dest_details.get(mmsi) or {}
+                                dest_code = str(ais.get("destcode") or "").strip().upper()
+                                dest_text = str(ais.get("destStd") or ais.get("dest") or "")
+                                dest_suffix = dest_text.rsplit(",", 1)[-1].strip().upper()
+                                if dest_code[:2] == "CN" or dest_suffix == "CN":
+                                    hit_cn = True
+                            if hit_cn:
+                                scores[mmsi] += 20
+                        top2 = sorted(scores.values(), reverse=True)[:2]
 
-                # 一个候选都没有: not_found; 重名且前两名分差 ≤15: multiple
+                # 都不满足或仍并列: not_found / multiple / unique
                 # (info 只给得分最高的前两个候选档案 dict, 高分在前、同分保序)
                 if not same:
                     entry = {"status": "not_found", "info": None}
@@ -384,8 +395,7 @@ class FreightowerAPI:
                 if entry["status"] == "unique":
                     break
             result[name] = entry
-
-        self._items["vessel_info"].update(result)
+        self._save_vessel_info(result)
         return result
 
     def set_mmsi(
@@ -413,21 +423,12 @@ class FreightowerAPI:
             mmsi_list = [str(int(float(m))) if pd.api.types.is_number(m) else str(m)
                          for m in mmsis if pd.notna(m)]
         self._mmsi_for_search = mmsi_list
-        # 逐块从分片把旧数据播种进内存, 本会话已抓的新数据优先,
-        # 其他船的存档不受影响 (拉另一张工作表不再冲掉既有结果)
-        for key in Store.MMSI_KEYED:
-            block = self._items[key]
-            saved = self._store.load(key)
-            for m in mmsi_list:
-                if m not in block and m in saved:
-                    block[m] = saved[m]
         return self
 
     def _check_mmsi(self):
         if not self._mmsi_for_search:
             raise ValueError('未设定用于搜索的mmsi，请先调用set_mmsi')
 
-    @_save_section("ais")
     def get_ais(self, get_ais_by_multiple: bool = True):
         """
         取多船 AIS 定位 + ETA getManyVesselDetail (批量一次) 或者 getVesselDetail (串行多次)。
@@ -435,6 +436,7 @@ class FreightowerAPI:
             get_ais_by_multiple: 在ais为True时，是否通过调并发多船接口getManyVesselDetail，若触发限流改用单船接口串行调用
         """
         self._check_mmsi()
+        batch: dict = {}
         if get_ais_by_multiple:
             ais_map = {}
             for i in range(0, len(self._mmsi_for_search), 300):
@@ -443,25 +445,24 @@ class FreightowerAPI:
                     {"mmsis": ",".join(self._mmsi_for_search[i:i + 300])})
                 ais_map.update({str(r["mmsi"]): r for r in rows})
             for m in self._mmsi_for_search:
-                self._items["ais"][m] = ais_map.get(m)
+                batch[m] = ais_map.get(m)
         else: # 串行请求, 不并发以免限流; 单船接口无数据时 _get 返回 []
             for m in self._mmsi_for_search:
                 rec = self._get("/vessel2/ais/getVesselDetail", {"mmsi": m})
-                self._items["ais"][m] = rec if isinstance(rec, dict) else None
+                batch[m] = rec if isinstance(rec, dict) else None
+        self._save_batch("ais", batch)
         return self
 
-    @_save_section("current_port")
     def get_current_port(self):
         """
         取当前挂靠港 getCurrentVoyageByMmsi
         """
         self._check_mmsi()
-        for m in self._mmsi_for_search:
-            self._items["current_port"][m] = self._get(
-                "/vessel2/getCurrentVoyageByMmsi", {"mmsi": m})
+        batch = {m: self._get("/vessel2/getCurrentVoyageByMmsi", {"mmsi": m})
+                 for m in self._mmsi_for_search}
+        self._save_batch("current_port", batch)
         return self
 
-    @_save_section("history_ports")
     def get_history_port(self, port_call_days: int = 90):
         """
         取历史挂靠港 getPortCallContainerByMmsi。
@@ -471,13 +472,12 @@ class FreightowerAPI:
         self._check_mmsi()
         now = datetime.now()
         begin = (now - timedelta(days=port_call_days)).strftime(self._date_format)
-        for m in self._mmsi_for_search:
-            self._items["history_ports"][m] = self._get(
-                "/vessel2/getPortCallContainerByMmsi",
-                {"mmsi": m, "begin": begin})
+        batch = {m: self._get("/vessel2/getPortCallContainerByMmsi",
+                              {"mmsi": m, "begin": begin})
+                 for m in self._mmsi_for_search}
+        self._save_batch("history_ports", batch)
         return self
 
-    @_save_section("history_route")
     def get_history_route(self, history_route_days: int = 40):
         """
         取历史轨迹 getVesselVoyage
@@ -487,6 +487,7 @@ class FreightowerAPI:
         self._check_mmsi()
         now = datetime.now()
         v_start, v_end = now - timedelta(days=history_route_days), now
+        batch = {}
         for m in self._mmsi_for_search:
             rows, cursor = [], v_start  # 每艘船独立切片, 单时间窗 ≤90 天
             while cursor < v_end:
@@ -495,10 +496,10 @@ class FreightowerAPI:
                     "mmsi": m, "startTime": cursor.strftime(self._date_format),
                     "endTime": seg_end.strftime(self._date_format)})
                 cursor = seg_end
-            self._items["history_route"][m] = rows
+            batch[m] = rows
+        self._save_batch("history_route", batch)
         return self
 
-    @_save_section("future_route")
     def get_future_route(self):
         """取船舶预测轨迹 /gis/route/plan/byvessel。
 
@@ -506,14 +507,16 @@ class FreightowerAPI:
         无 destcode 时接口无预测, 记为 []。
         """
         self._check_mmsi()
+        ais = self._store.load("ais")
+        batch = {}
         for m in self._mmsi_for_search:
-            dest = (self._items["ais"].get(m) or {}).get("destcode")
+            dest = (ais.get(m) or {}).get("destcode")
             params = {"vessel": m}
             if dest:
                 params["pod"] = dest
             rec = self._get("/gis/route/plan/byvessel", params)
-            self._items["future_route"][m] = (
-                rec if isinstance(rec, dict) else [])
+            batch[m] = rec if isinstance(rec, dict) else []
+        self._save_batch("future_route", batch)
         return self
 
     @property

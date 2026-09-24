@@ -29,10 +29,10 @@ class FreightowerAPI:
         self._http.headers.update({"User-Agent": self._ua, "Accept": "application/json"})
         self._http.headers["Authorization"] = "Bearer " + self._login(force=force)
         self._store = Store()
-        # 内存与磁盘分片一一对应: 键名即 Store.ITEMS (info/ais/...),
+        # 内存与磁盘分片一一对应: 键名即 Store.FILES (vessel_info/ais/...),
         # 值均为 {键: data}; 展示视图统一由 Present 现拼
-        self._items = {key: {} for key in Store.ITEMS}
-        self._items["info"] = self._store.load_info()
+        self._items = {key: {} for key in Store.FILES}
+        self._items["vessel_info"] = self._store.load("vessel_info")
         self._mmsi_for_search = []
         self._date_format = "%Y-%m-%d %H:%M:%S"
 
@@ -40,21 +40,21 @@ class FreightowerAPI:
         """删除存档并同步内存; names=None 清空全部。语义见 :meth:`Store.delete`。"""
         if names is None:
             self._store.delete(None)
-            self._items = {key: {} for key in Store.ITEMS}
+            self._items = {key: {} for key in Store.FILES}
             self._mmsi_for_search = []
             return self
         wanted = {names} if isinstance(names, str) else {str(n) for n in names}
         target_mmsis = set()
         for name in wanted:  # 汇总待删船名涉及的 mmsi (含 multiple 的两个候选)
-            rec = self._items["info"].get(name)
+            rec = self._items["vessel_info"].get(name)
             if isinstance(rec, dict):
                 target_mmsis |= Store._entry_mmsis(rec)
         self._store.delete(wanted)
         # 内存与磁盘保持一致: 删指定船名 + 引用目标 mmsi 的别名条目
-        for query, rec in list(self._items["info"].items()):
+        for query, rec in list(self._items["vessel_info"].items()):
             if query in wanted or (target_mmsis
                                    and target_mmsis & Store._entry_mmsis(rec)):
-                self._items["info"].pop(query, None)
+                self._items["vessel_info"].pop(query, None)
         for key in Store.MMSI_KEYED:
             for m in target_mmsis:
                 self._items[key].pop(m, None)
@@ -75,20 +75,20 @@ class FreightowerAPI:
                 block = self._items[section]
                 vessels = {m: block[m] for m in self._mmsi_for_search if m in block}
                 try:
-                    self._store.save_items(section, vessels)
+                    self._store.save(section, vessels)
                 except OSError as e:
                     log.warning(f"结果块 {section} 写入失败: {e}")
                 return result
             return wrapper
         return decorator
 
-    def _save_info(method):
-        """船名查询方法装饰器: 读完即把船名结果 merge 进 .info.json。"""
+    def _save_vessel_info(method):
+        """船名查询方法装饰器: 读完即把船名结果 merge 进 .vessel_info.json。"""
         @functools.wraps(method)
         def wrapper(self: "FreightowerAPI", *args, **kwargs):
             result = method(self, *args, **kwargs)
             try:
-                self._store.save_items("info", self._items["info"])
+                self._store.save("vessel_info", self._items["vessel_info"])
             except OSError as e:
                 log.warning(f"船名结果写入失败: {e}")
             return result
@@ -217,7 +217,7 @@ class FreightowerAPI:
             score += max(0, 30 - int(age_days))  # AIS 越新分越高, 30 天前封顶为 0
         return score
     
-    @_save_info
+    @_save_vessel_info
     def get_info_by_vessel_name(
         self,
         names: "str | list[str] | tuple[str, ...]",
@@ -385,7 +385,7 @@ class FreightowerAPI:
                     break
             result[name] = entry
 
-        self._items["info"].update(result)
+        self._items["vessel_info"].update(result)
         return result
 
     def set_mmsi(
@@ -413,12 +413,11 @@ class FreightowerAPI:
             mmsi_list = [str(int(float(m))) if pd.api.types.is_number(m) else str(m)
                          for m in mmsis if pd.notna(m)]
         self._mmsi_for_search = mmsi_list
-        # 只登记不清空: 逐块从分片把旧数据播种进内存, 本会话已抓的新数据优先,
+        # 逐块从分片把旧数据播种进内存, 本会话已抓的新数据优先,
         # 其他船的存档不受影响 (拉另一张工作表不再冲掉既有结果)
-        self._store.register(mmsi_list)
         for key in Store.MMSI_KEYED:
             block = self._items[key]
-            saved = self._store.load_items(key)
+            saved = self._store.load(key)
             for m in mmsi_list:
                 if m not in block and m in saved:
                     block[m] = saved[m]
@@ -522,6 +521,6 @@ class FreightowerAPI:
         """
         调用Presentation，展示结果
         """
-        return Present(api=self)
+        return Present()
 
 

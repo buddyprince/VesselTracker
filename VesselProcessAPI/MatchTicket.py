@@ -34,46 +34,99 @@ class MatchTicket:
         self._store = Store(save_returns) if save_returns else Store()
         self._io = JsonOperation(Path(__file__).with_name(".json") / ".match_tickets")
 
-    # ── 缓存：info_df ────────────────────────
+    # ── 缓存读写 ────────────────────────────
 
-    def get_info_df(self) -> pd.DataFrame:
-        """带缓存的 info_df: 同一 Store 快照内不重复构建。"""
-        cache = self._io._read(".info_df.json")
-        if JsonOperation._cache_fresh(cache, self._store.updated_at):
-            df = pd.DataFrame(cache["items"])
-            if "mmsi" in df.columns:
-                df["mmsi"] = df["mmsi"].astype("string")
+    def _read_cache(self, name: str, key: Optional[str] = None) -> Optional[pd.DataFrame]:
+        """读缓存; 命中返回 DataFrame, 未命中/过期返回 None。
+
+        Args:
+            name: 缓存文件名。
+            key: 多国分键缓存的国家码; None 时 items 直接是行列表。
+        """
+        cache = self._io.read(name)
+        # 时间戳不一致 => Store 已更新, 缓存过期
+        if not JsonOperation.cache_fresh(cache, self._store.updated_at):
+            return None
+        items = cache.get("items")
+        if key is not None:
+            # 分键结构 {country: rows}; 缺该国 => 未命中
+            if not isinstance(items, dict) or key not in items:
+                return None
+            items = items[key]
+        # 空 items 也按命中处理, 由 _ensure_vessel_info_cols 补列
+        if not isinstance(items, list):
+            return None
+        df = pd.DataFrame(items)
+        if df.empty and key is None:
             return df
-        df = self._build_info_df()
-        self._io._write(".info_df.json", {
-            "updated_at": self._store.updated_at,
-            "items": json.loads(
-                df.to_json(orient="records", force_ascii=False, date_format="iso")
-            ),
-        })
+        # JSON 还原类型: mmsi 统一 string, 时间列转 datetime
+        if "mmsi" in df.columns:
+            df["mmsi"] = df["mmsi"].astype("string")
+        for col in ("arrival_time", "departure_time"):
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
         return df
 
-    # ── 缓存：port_calls_by_country ───────────────────────
+    def _write_cache(self, name: str, df: pd.DataFrame, key: Optional[str] = None) -> None:
+        """按 Store 时间戳写入缓存。
+
+        Args:
+            name: 缓存文件名。
+            df: 待写入的 DataFrame。
+            key: 多国分键缓存的国家码; None 时 items 直接是行列表。
+        """
+        # DataFrame -> JSON records; 日期转 ISO 字符串, 中文不转义
+        rows = json.loads(
+            df.to_json(orient="records", force_ascii=False, date_format="iso")
+        )
+        if key is None:
+            # 平铺结构: items 直接是行列表, 整体覆盖
+            items = rows
+        else:
+            # 分键结构: 保留同快照内其他国家, 只覆盖当前 key
+            cache = self._io.read(name)
+            if JsonOperation.cache_fresh(cache, self._store.updated_at):
+                items = dict(cache.get("items") or {})
+            else:
+                # 旧缓存过期/损坏时清空重建, 避免混入过期国家数据
+                items = {}
+            items[key] = rows
+        # updated_at 记为当前 Store 时间戳, 与 _read_cache 的新鲜度判断对齐
+        self._io.write(name, {
+            "updated_at": self._store.updated_at,
+            "items": items,
+        })
+
+    # ── info_df ────────────────────────
+
+    VESSEL_INFO_BASE_COLS = (
+        "query_vessel_name", "status", "mmsi", "shipType", "flagName",
+    )
+
+    def get_vessel_info_df(self) -> pd.DataFrame:
+        """带缓存的 vessel_info DataFrame: 同一 Store 快照内不重复构建。"""
+        df = self._read_cache(".info_df.json")
+        if df is not None:
+            return self._ensure_vessel_info_cols(df)
+        df = self._ensure_vessel_info_cols(self._build_vessel_info_df())
+        self._write_cache(".info_df.json", df)
+        return df
+
+    @classmethod
+    def _ensure_vessel_info_cols(cls, df: pd.DataFrame) -> pd.DataFrame:
+        """补齐 vessel_info 基础列, 避免下游 merge/drop_duplicates KeyError。"""
+        return Tool.ensure_columns(df, cls.VESSEL_INFO_BASE_COLS)
+
+    # ── port_calls_by_country ───────────────────────
 
     def get_port_calls_by_country(self, country: str = "CN") -> pd.DataFrame:
         """带缓存的 port_calls: 同一 Store 快照内不重复构建。"""
         code = country.strip().upper()
-        cache = self._io._read(".port_calls_by_country.json")
-        if JsonOperation._cache_fresh(cache, self._store.updated_at) and code in (cache.get("items") or {}):
-            df = pd.DataFrame(cache["items"][code])
-            for col in ("arrival_time", "departure_time"):
-                if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], errors="coerce")
+        df = self._read_cache(".port_calls_by_country.json", code)
+        if df is not None:
             return df
         df = self._build_port_calls_by_country(code)
-        items = cache.get("items", {}) if JsonOperation._cache_fresh(cache, self._store.updated_at) else {}
-        items[code] = json.loads(
-            df.to_json(orient="records", force_ascii=False, date_format="iso")
-        )
-        self._io._write(".port_calls_by_country.json", {
-            "updated_at": self._store.updated_at,
-            "items": items,
-        })
+        self._write_cache(".port_calls_by_country.json", df, code)
         return df
 
     # ── 时间解析 ──────────────────────────────────────────────
@@ -97,16 +150,16 @@ class MatchTicket:
                     return ts, field
         return pd.NaT, None
 
-    # ── info 扁平化 ──────────────────────────────────────────
+    # ── vessel_info 扁平化 ────────────────────────────────────
 
-    def _build_info_df(self) -> pd.DataFrame:
-        """从 Store 加载 info dict，扁平化为 DataFrame。
+    def _build_vessel_info_df(self) -> pd.DataFrame:
+        """从 Store 加载 vessel_info dict，扁平化为 DataFrame。
 
         Returns:
             列: query_vessel_name, status, mmsi, vesselNameEn 等。
             mmsi 统一为字符串类型。
         """
-        info_dict = self._store.load_info()
+        info_dict = self._store.load("vessel_info")
         rows = []
         for name, entry in info_dict.items():
             status = entry["status"]
@@ -125,6 +178,7 @@ class MatchTicket:
                     })
 
         df = pd.DataFrame(rows)
+        df = Tool.ensure_columns(df, self.VESSEL_INFO_BASE_COLS)
         if "mmsi" in df.columns:
             df["mmsi"] = df["mmsi"].apply(
                 lambda x: str(int(x))
@@ -151,13 +205,15 @@ class MatchTicket:
             列: mmsi, port_code, port_name_en, port_name_cn,
             country_code, arrival_time, departure_time, call_type。
         """
-        by_mmsi = self._store.load_all()[1]
+        hist = self._store.load("history_ports")
+        cur_map = self._store.load("current_port")
+        ais_map = self._store.load("ais")
         code = country.strip().upper()
         rows = []
 
-        for mmsi, entry in by_mmsi.items():
-            records = list(entry.get("history_ports") or [])
-            cur = entry.get("current_port")
+        for mmsi in set(hist) | set(cur_map) | set(ais_map):
+            records:list[dict] = list(hist.get(mmsi) or [])
+            cur = cur_map.get(mmsi)
             if isinstance(cur, list):
                 records += cur
             elif isinstance(cur, dict):
@@ -186,7 +242,7 @@ class MatchTicket:
                     "arrival_source": source,
                 })
 
-            ais = entry.get("ais") or {}
+            ais = ais_map.get(mmsi) or {}
             eta, source = self._first_parseable(ais, self.ETA_FIELDS)
             if pd.notna(eta):
                 dest_code = str(
@@ -224,6 +280,7 @@ class MatchTicket:
         self,
         tickets: pd.DataFrame,
         port_calls: pd.DataFrame,
+        max_voyage_days: "int | None" = None,
     ) -> pd.DataFrame:
         """贪心配票（actual + ETA + estimated 兜底）。
 
@@ -231,12 +288,14 @@ class MatchTicket:
         挂靠只消耗一次。actual 优先 -> ETA 回退 -> estimated 兜底。
         estimated 行的 arrival_time 暂填 NaT，由调用方在 combine 中补算。
 
-        拷贝 tickets 为 assigned，匹配成功时将挂靠记录的全部字段写入对应行，
-        未匹配行仅标记 call_type='estimated'。列筛选由调用方负责。
+        航程约束: arrival < departure 的挂靠对后续票也过早, 跳过并消费;
+        arrival - departure > max_voyage_days 只对当前票不合法, 不消费
+        该挂靠 (留给 departure 更晚、航程更短的票), 当前票走 ETA/estimated。
 
         Args:
             tickets: 含 mmsi, departure_from_origin_port 的 DataFrame。
             port_calls: 归一化挂靠事件。
+            max_voyage_days: 航程上界(天), None 不限制。
 
         Returns:
             添加了挂靠信息的 assigned DataFrame。
@@ -246,6 +305,8 @@ class MatchTicket:
 
         if assigned.empty or port_calls.empty:
             return assigned
+
+        max_days = int(max_voyage_days) if max_voyage_days else None
 
         for mmsi, grp in assigned.groupby("mmsi"):
             calls = port_calls[
@@ -276,11 +337,17 @@ class MatchTicket:
 
                 matched = None
                 if ptr < len(actuals):
-                    matched = actuals[ptr]
-                    ptr += 1
-                elif (eta_row is not None
-                      and eta_row["arrival_time"] >= dep):
-                    matched = eta_row
+                    voyage = (actuals[ptr]["arrival_time"] - dep).days
+                    if max_days is None or voyage <= max_days:
+                        matched = actuals[ptr]
+                        ptr += 1
+                    # voyage > max: 不消费 ptr, 留给 dep 更晚的票
+
+                if (matched is None and eta_row is not None
+                        and eta_row["arrival_time"] >= dep):
+                    eta_voyage = (eta_row["arrival_time"] - dep).days
+                    if max_days is None or eta_voyage <= max_days:
+                        matched = eta_row
 
                 if matched:
                     for k, v in matched.items():
@@ -299,6 +366,7 @@ class MatchTicket:
         country: str = "CN",
         sheet_name=0,
         write_cache=True,
+        max_voyage_days: "int | None" = 90,
     ) -> pd.DataFrame:
         """读取原始船表，匹配全部挂靠，返回配票结果并缓存到 JSON。
 
@@ -311,16 +379,17 @@ class MatchTicket:
             quantity_col: 装运量列名，非 None 时去除逗号并转为 float。
             country: 目标国家码。
             sheet_name: Excel sheet 名或序号。
+            max_voyage_days: 配票航程上界(天), None 不限制; 默认与查询超窗一致。
 
         Returns:
             原始船表列 + port_code, port_name_en, port_name_cn,
             arrival_time, departure_time, call_type。
         """
         # 读原始船表，merge mmsi
-        initial_vessel_df = Tool().read_initial_vessel_sheet(
+        initial_vessel_df = Tool.read_initial_vessel_sheet(
             initial_vessel_sheet, sheet_name=sheet_name, quantity_col=quantity_col
         )
-        info_df = self.get_info_df()
+        info_df = self.get_vessel_info_df()
         initial_vessel_df_JOIN_info_df = initial_vessel_df.merge(
             info_df[["query_vessel_name", "mmsi", "status"]],
             how="left", on="query_vessel_name",
@@ -337,7 +406,9 @@ class MatchTicket:
         tickets["mmsi"] = tickets["mmsi"].astype("string")
 
         # 贪心配票（actual + ETA + estimated 兜底）
-        result = self._greedy_assign_tickets_with_port_calls(tickets, port_calls)
+        result = self._greedy_assign_tickets_with_port_calls(
+            tickets, port_calls, max_voyage_days=max_voyage_days,
+        )
 
         # 保留原始船表列 + 港口信息列
         keep_cols = list(tickets.columns) + [
@@ -348,18 +419,8 @@ class MatchTicket:
 
         # 缓存到 JSON (按 sheet_name 分键)
         if write_cache:
-            cache = self._io._read(".matched_tickets_with_port_calls.json") or {}
-            store_ts = self._store.updated_at
-            if cache.get("updated_at") == store_ts and isinstance(cache.get("items"), dict):
-                items = dict(cache["items"])
-            else:
-                items = {}
-            items[str(sheet_name)] = json.loads(
-                result.to_json(orient="records", force_ascii=False, date_format="iso")
+            self._write_cache(
+                ".matched_tickets_with_port_calls.json", result, key=str(sheet_name)
             )
-            self._io._write(".matched_tickets_with_port_calls.json", {
-                "updated_at": store_ts,
-                "items": items,
-            })
 
         return result

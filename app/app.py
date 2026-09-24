@@ -17,6 +17,9 @@ import streamlit as st
 
 from VesselProcessAPI import FreightowerAPI, MatchTicket, Present, Store, Tool
 
+ARRIVAL_PHASE_ORDER = Present.ARRIVAL_PHASE_ORDER
+calculate_week_number = Tool.calculate_week_number
+
 APP_DATA_DIR = Path(__file__).resolve().parent / "app_data"
 INITIAL_XLSX = APP_DATA_DIR / "initial_vessel_sheet.xlsx"
 
@@ -28,6 +31,7 @@ def current_workbook_path():
 
 MANAGED_COLS = ["status", "mmsi", "shipType", "flagName"]
 MAPPING_VIEW_COLS = ["query_vessel_name", *MANAGED_COLS]
+ORIGIN_DAYS = {"美湾": 60, "美西": 25, "巴西": 48, "阿根廷": 60}
 
 st.set_page_config(
     page_title="船表跟踪流程",
@@ -45,11 +49,15 @@ class _LogCollector(logging.Handler):
         self.messages.append(self.format(record))
 
 
-def snapshot_saved_at():
+def store_updated_at():
     try:
         return Store().updated_at
     except Exception:
         return None
+
+
+def _month_end(d: date) -> date:
+    return date(d.year + (d.month == 12), d.month % 12 + 1, 1) - timedelta(days=1)
 
 
 def normalize_mmsi(value):
@@ -71,6 +79,39 @@ def load_initial_workbook(path=None):
     return pd.read_excel(workbook_path, sheet_name=None)
 
 
+def resolve_departure_col(df):
+    """配票用离港时间列: session 选择优先, 否则 departure, 否则第一列。"""
+    chosen = st.session_state.get("departure_col")
+    if chosen and chosen in df.columns:
+        return chosen
+    if "departure" in df.columns:
+        return "departure"
+    return df.columns[0] if len(df.columns) else None
+
+
+def regenerate_match_cache():
+    """按当前工作簿全部 sheet 重算配票缓存; 失败静默忽略。"""
+    workbook = current_workbook_path()
+    if not workbook.is_file():
+        return
+    try:
+        sheets = load_initial_workbook(workbook)
+        window = st.session_state.get("max_voyage_days", 90)
+        max_voyage_days = int(window) if window else None
+        for name, df in sheets.items():
+            dt_col = resolve_departure_col(df)
+            if dt_col is None:
+                continue
+            MatchTicket().generate_matched_tickets_with_port_calls(
+                df, dt_col,
+                country=st.session_state.arrival_country,
+                sheet_name=name, write_cache=True,
+                max_voyage_days=max_voyage_days,
+            )
+    except Exception:
+        pass
+
+
 def save_workbook(path, sheets):
     tmp = path.with_suffix(".tmp.xlsx")
     with pd.ExcelWriter(tmp, engine="openpyxl") as writer:
@@ -90,20 +131,28 @@ def mapping_view(sheet_name, snapshot_stamp, workbook_path):
         "query_vessel_name":
             initial["query_vessel_name"].dropna().astype(str).drop_duplicates()
     })
-    info = Present().get_info_by_vessel_name
+    info = Present().get_vessel_info_df
     info = info[[c for c in MAPPING_VIEW_COLS if c in info.columns]]
-    if "query_vessel_name" in info.columns:
-        info = info.drop_duplicates(
-            subset=["query_vessel_name", "mmsi"], keep="first"
-        )
-    return roster.merge(info, on="query_vessel_name", how="left")
+    if "query_vessel_name" not in info.columns:
+        # Store 空/异常: 只回花名册, 补空管理列便于编辑
+        return Tool.ensure_columns(roster, MAPPING_VIEW_COLS)
+    subset = [c for c in ("query_vessel_name", "mmsi") if c in info.columns]
+    info = info.drop_duplicates(subset=subset, keep="first")
+    merged = roster.merge(info, on="query_vessel_name", how="left")
+    return Tool.ensure_columns(merged, MAPPING_VIEW_COLS)
+
+
+@st.cache_data(show_spinner=False)
+def archived_mmsis(stamp):
+    """存档内有抓取数据的 mmsi 集合; stamp 变化时重算。"""
+    return Store().archived_mmsis
 
 
 @st.cache_data(show_spinner=False)
 def mmsis_for_names(names, snapshot_stamp):
     """给定船名集合, 返回其在 Store 中涉及的全部 mmsi (multiple 含两个候选)。"""
-    info = Present().get_info_by_vessel_name
-    if "mmsi" not in info.columns:
+    info = Present().get_vessel_info_df
+    if "mmsi" not in info.columns or "query_vessel_name" not in info.columns:
         return []
     hit = info[info["query_vessel_name"].astype(str).isin(set(names))]
     return sorted({
@@ -123,7 +172,7 @@ def sheet_mmsis(sheet_name, snapshot_stamp, workbook_path):
 
 
 def info_entries_from_editor(df):
-    """把映射编辑器的行还原为 Store 的 info 信封 {船名: {status, info}}。
+    """把映射编辑器的行还原为 Store 的 vessel_info 信封 {船名: {status, info}}。
 
     仅保存有明确状态或 mmsi 的船名, 未查询的空行不写入 (避免污染 Store)。
     """
@@ -158,282 +207,92 @@ def info_entries_from_editor(df):
     return result
 
 
-def precompute_matched_tickets(
-    initial_df, country, datetime_col, snapshot_stamp,
-):
-    """预计算配票并写入共享 JSON 缓存文件。
-
-    注意：此函数有副作用（写文件），不应被 st.cache_data 缓存。
-    缓存命中会导致文件不更新，下游读到旧数据。
-    """
-    # 清空旧缓存，防止 combine(sheet_name=None) 合并多 sheet 旧数据导致重复计数
-    cache_path = Path(sys.modules[MatchTicket.__module__].__file__).with_name(".json") / ".match_tickets" / ".matched_tickets_with_port_calls.json"
-    if cache_path.is_file():
-        cache_path.unlink()
-    mt = MatchTicket()
-    mt.generate_matched_tickets_with_port_calls(initial_df, datetime_col, country)
-    return json.loads(cache_path.read_text(encoding="utf-8")).get("updated_at")
-
-
-@st.cache_data(show_spinner=False)
-def build_tracking_outputs(
-    initial_df,
-    start,
-    end,
-    country,
-    snapshot_stamp,
-    datetime_col=None,
-    expected_shipping_days=None,
-    sheet_name=None,
-):
-    precompute_matched_tickets(initial_df, country, datetime_col, snapshot_stamp)
-    present = Present()
-    combined = present.combine_initial_vessel_sheet_with_query_result(
-        str(start), str(end), expected_shipping_days, sheet_name=sheet_name,
-    )
-    roster = Tool().read_initial_vessel_sheet(initial_df)
-    roster_names = set(roster["query_vessel_name"].dropna().astype(str))
-    
-    # 过滤combined，只保留当前sheet中的船
-    if "query_vessel_name" in combined.columns:
-        combined = combined[
-            combined["query_vessel_name"].astype(str).isin(roster_names)
-        ].reset_index(drop=True)
-    
-    info = present.get_info_by_vessel_name
-    mmsis = set(
-        info.loc[
-            info["query_vessel_name"].isin(roster_names), "mmsi"
-        ].dropna().astype(str)
-    )
-    current = present.current_situation
-    if "mmsi" in current.columns:
-        current = current[
-            current["mmsi"].astype(str).isin(mmsis)
-        ].reset_index(drop=True)
-    return combined, current, present.returns_by_mmsi
-
-
-def custom_saturday_weeks(arrival_time: pd.Series) -> pd.DataFrame:
-    week_start = (
-        arrival_time.dt.normalize()
-        - pd.to_timedelta((arrival_time.dt.weekday + 2) % 7, unit="D")
-    )
-    years = range(int(week_start.dt.year.min()) - 1,
-                  int(week_start.dt.year.max()) + 2)
-    year_starts = {}
-    for year in years:
-        jan_first = pd.Timestamp(year=year, month=1, day=1)
-        year_starts[year] = jan_first - pd.Timedelta(
-            days=(jan_first.weekday() + 2) % 7
-        )
-
-    labels = []
-    for ws in week_start:
-        year = ws.year
-        if ws < year_starts[year]:
-            year -= 1
-        elif ws >= year_starts[year + 1]:
-            year += 1
-        year_start = year_starts[year]
-        week = (ws - year_start).days // 7 + 1
-        labels.append((year, int(week), ws, ws + pd.Timedelta(days=6)))
-    return pd.DataFrame(
-        labels, columns=["year", "week", "week_start", "week_end"]
-    )
-
-
-ARRIVAL_PHASE_ORDER = ["靠泊", "锚泊", "港界待靠", "在途 ETA", "估算到港"]
 ARRIVAL_PHASE_COLORS = [
-    "#54a24b", "#4c78a8", "#f58518", "#b279a2", "#e45756",
+    "#54a24b", "#4c78a8", "#b279a2", "#e45756",
 ]
 
 
-ARRIVAL_SOURCE_TO_PHASE = {
-    "atBerthA": "靠泊", "atBerthArrival": "靠泊",
-    "atAnchorA": "锚泊", "atAnchorArrival": "锚泊",
-    "ata": "港界待靠", "atPortArrival": "港界待靠",
-    "etbStd": "在途 ETA", "etb": "在途 ETA",
-    "etaStd": "在途 ETA", "eta": "在途 ETA",
-    "estimated": "估算到港",
-}
-
-
-def _collect_arrival_rows(
-    initial_df, country,
-    datetime_col=None, expected_shipping_days=None,
-    sheet_configs=None, extra_cols=None,
-    skip_precompute=False,
-    start_date="1900-01-01", end_date="2100-01-01",
+def _gqs_multi(
+    start,
+    end,
+    sheet_days=None,
+    expected_shipping_days=None,
+    sheet_name=None,
+    status_filter=None,
+    outdated_eliminate_window=90,
 ):
-    """收集 unique 到港行, 按船名去重, 打月/周标签。
+    """单表或多表调 get_quantity_statistics，汇总后返回 (df, monthly, weekly)。
 
-    与查询页同口径: 先 combine(start, end) 取窗口内票, 再按船名
-    groupby 汇总 quantity (一票多行只计一次), 并用 departure_time
-    判定到港阶段。
+    gqs 只返回业务行 df；monthly/weekly 由本函数用 sum_by_phase 统一算。
+    sheet_days 非 None 时按各表航程天数分别取 df 再拼接汇总；
+    否则单表直调。空结果返回三空表。
     """
-    extra_cols = list(extra_cols or [])
-    
-    # 安全检查：确保datetime_col有效
-    if datetime_col is None or datetime_col not in initial_df.columns:
-        # 尝试使用默认列
-        available_cols = list(initial_df.columns)
-        if "departure" in available_cols:
-            datetime_col = "departure"
-        elif "arrival" in available_cols:
-            datetime_col = "arrival"
-        else:
-            # 没有任何可用列，返回空DataFrame
-            out_cols = [
-                "query_vessel_name", "arrival_time", "arrival_source",
-                "departure_time", "quantity", "phase",
-                "year", "week", "week_start", "week_end",
-                "cal_year", "cal_month", *extra_cols,
-            ]
-            return pd.DataFrame(columns=out_cols)
-    
     present = Present()
-
-    def _combine(df, dt_col, days, sheet_name=None):
-        return present.combine_initial_vessel_sheet_with_query_result(
-            start_date, end_date, days, sheet_name=sheet_name,
-        )
-
-    if sheet_configs is not None:
-        if not skip_precompute:
-            import json as _json
-            _sheet_items = {}
-            for item in sheet_configs:
-                df, dt_col, days = item[0], item[1], item[2]
-                _sn = item[3] if len(item) > 3 else None
-                mt = MatchTicket()
-                result = mt.generate_matched_tickets_with_port_calls(df, dt_col, country, write_cache=False)
-                _sheet_items[str(_sn)] = _json.loads(
-                    result.to_json(orient="records", force_ascii=False, date_format="iso")
-                )
-            _cache_path = Path(sys.modules[MatchTicket.__module__].__file__).with_name(".json") / ".match_tickets" / ".matched_tickets_with_port_calls.json"
-            _cache_data = {
-                "updated_at": snapshot_saved_at() or datetime.now().isoformat(),
-                "items": _sheet_items,
-            }
-            _cache_path.write_text(_json.dumps(_cache_data, ensure_ascii=False), encoding="utf-8")
-        parts = [_combine(item[0], item[1], item[2], sheet_name=item[3] if len(item) > 3 else None) for item in sheet_configs]
-        combined = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-    else:
-        if not skip_precompute:
-            precompute_matched_tickets(
-                initial_df, country, datetime_col, snapshot_saved_at(),
+    if sheet_days is not None:
+        parts = [
+            present.get_quantity_statistics(
+                str(start), str(end),
+                expected_shipping_days=days,
+                sheet_name=sn,
+                status_filter=status_filter,
+                outdated_eliminate_window=outdated_eliminate_window,
             )
-        combined = present.combine_initial_vessel_sheet_with_query_result(
-            start_date, end_date, expected_shipping_days,
+            for sn, days in sheet_days.items()
+        ]
+        df = (
+            pd.concat(parts, ignore_index=True)
+            if parts else pd.DataFrame()
         )
-
-    read_cols = [
-        "query_vessel_name", "arrival_time", "arrival_source",
-        "departure_time", "quantity",
-        *extra_cols,
-    ]
-    out_cols = [
-        "query_vessel_name", "arrival_time", "arrival_source",
-        "departure_time", "quantity", "phase",
-        "year", "week", "week_start", "week_end",
-        "cal_year", "cal_month", *extra_cols,
-    ]
-    if combined.empty or "arrival_time" not in combined.columns:
-        return pd.DataFrame(columns=out_cols)
-    arr = combined[combined["arrival_time"].notna()]
-    if "status" in arr.columns:
-        arr = arr[arr["status"] == "unique"]
-    if arr.empty:
-        return pd.DataFrame(columns=out_cols)
-
-    arrived = arr[[c for c in read_cols if c in arr.columns]].copy()
-    arrived["arrival_time"] = pd.to_datetime(arrived["arrival_time"])
-    arrived["quantity"] = pd.to_numeric(
-        arrived["quantity"].astype(str).str.replace(",", "", regex=False).str.strip(),
-        errors="coerce",
-    ).fillna(0.0)
-
-    # 按船名去重: 同一条船多张票只计一次 quantity, 与查询页一致
-    agg_dict = {
-        "arrival_time": "first",
-        "arrival_source": "first",
-        "quantity": "sum",
-    }
-    if "departure_time" in arrived.columns:
-        arrived["departure_time"] = pd.to_datetime(arrived["departure_time"], errors="coerce")
-        agg_dict["departure_time"] = "first"
-    for ec in extra_cols:
-        if ec in arrived.columns:
-            agg_dict[ec] = "first"
-    arrived = (
-        arrived.groupby("query_vessel_name", as_index=False).agg(agg_dict).reset_index(drop=True)
-    )
-
-    # 阶段判定: 与查询页逻辑一致 (检查 departure_time)
-    eta_fields = {"etbStd", "etb", "etaStd", "eta"}
-    anchor_fields = {"atAnchorA", "atAnchorArrival"}
-    def _assign_phase(row):
-        src = row.get("arrival_source")
-        dep = row.get("departure_time")
-        if src == "estimated":
-            return "估算到港"
-        if src in eta_fields:
-            return "在途 ETA"
-        if pd.notna(dep) or src in ("atBerthA", "atBerthArrival"):
-            return "靠泊"
-        if src in anchor_fields:
-            return "锚泊"
-        return "港界待靠"
-    arrived["phase"] = arrived.apply(_assign_phase, axis=1)
-
-    arrived["cal_year"] = arrived["arrival_time"].dt.year
-    arrived["cal_month"] = arrived["arrival_time"].dt.month
-    week_labels = custom_saturday_weeks(arrived["arrival_time"])
-    week_labels.index = arrived.index
-    arrived[["year", "week", "week_start", "week_end"]] = week_labels
-    return arrived[out_cols].sort_values(["cal_year", "cal_month"]).reset_index(drop=True)
+    else:
+        df = present.get_quantity_statistics(
+            str(start), str(end),
+            expected_shipping_days=expected_shipping_days,
+            sheet_name=sheet_name,
+            status_filter=status_filter,
+            outdated_eliminate_window=outdated_eliminate_window,
+        )
+    if df.empty or "quantity" not in df.columns:
+        return df, pd.DataFrame(), pd.DataFrame()
+    monthly = Present.sum_by_phase(df, "cal_year", "cal_month")
+    weekly = Present.sum_by_phase(df, "week_year", "week_num")
+    return df, monthly, weekly
 
 
-def weekly_arrival_tonnage(initial_df, country, snapshot_stamp, datetime_col=None, expected_shipping_days=None, sheet_configs=None, skip_precompute=False, start_date="1900-01-01", end_date="2100-01-01"):
-    return _collect_arrival_rows(
-        initial_df, country,
-        datetime_col, expected_shipping_days, sheet_configs,
-        skip_precompute=skip_precompute,
-        start_date=start_date, end_date=end_date,
-    )
+def _get_arrival_df_for_chart(
+    sheet_configs,
+    expected_shipping_days=None, sheet_name=None,
+    start_date="1900-01-01", end_date="2100-01-01",
+    outdated_eliminate_window=90,
+):
+    """返回 (明细 df, monthly 长表, weekly 长表)；多 sheet 时先拼明细再统一汇总。"""
+    if sheet_configs is not None:
+        sheet_days = {
+            (item[3] if len(item) > 3 else None): item[2]
+            for item in sheet_configs
+        }
+        combined, monthly, weekly = _gqs_multi(
+            start_date, end_date,
+            sheet_days=sheet_days,
+            status_filter="unique",
+            outdated_eliminate_window=outdated_eliminate_window,
+        )
+    else:
+        combined, monthly, weekly = _gqs_multi(
+            start_date, end_date,
+            expected_shipping_days=expected_shipping_days,
+            sheet_name=sheet_name,
+            status_filter="unique",
+            outdated_eliminate_window=outdated_eliminate_window,
+        )
+    if combined.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    return combined.reset_index(drop=True), monthly, weekly
 
 
-def arrival_by_port_granular(initial_df, country, snapshot_stamp, datetime_col=None, expected_shipping_days=None, sheet_configs=None, skip_precompute=False, start_date="1900-01-01", end_date="2100-01-01"):
-    port_cols = ["port_name_cn", "year", "week", "month", "quantity"]
-    rows = _collect_arrival_rows(
-        initial_df, country,
-        datetime_col, expected_shipping_days, sheet_configs,
-        extra_cols=["port_name_cn"],
-        skip_precompute=skip_precompute,
-        start_date=start_date, end_date=end_date,
-    )
-    if rows.empty:
-        return pd.DataFrame(columns=port_cols)
-    # 分区域 tab 的年/月沿用到港自然年/月 (不用自定义周年)
-    return pd.DataFrame({
-        "port_name_cn": rows["port_name_cn"],
-        "year": rows["cal_year"],
-        "week": rows["week"],
-        "month": rows["cal_month"],
-        "quantity": rows["quantity"],
-    })
-
-
-def clear_tracking_caches():
-    build_tracking_outputs.clear()
-
-
-@st.cache_data(show_spinner=False)
-def render_route_map(by_mmsi_subset, snapshot_stamp):
+def render_route_map(mmsis, snapshot_stamp):
     from VesselProcessAPI import Map
 
-    return Map(by_mmsi_subset).route.get_root().render()
+    return Map(mmsis).route.get_root().render()
 
 
 def run_login(force, box):
@@ -487,6 +346,10 @@ if "wb_edited" not in st.session_state:
     st.session_state.wb_edited = None
 if "wb_edited_path" not in st.session_state:
     st.session_state.wb_edited_path = None
+if "arrival_country" not in st.session_state:
+    st.session_state.arrival_country = "CN"
+if "departure_col" not in st.session_state:
+    st.session_state.departure_col = None
 
 
 def reset_workbook_ui_state():
@@ -494,6 +357,7 @@ def reset_workbook_ui_state():
     st.session_state.wb_edited_path = None
     st.session_state.pop("track_sheet", None)
     st.session_state.pop("chart_sheet", None)
+    st.session_state.pop("departure_col", None)
     for key in list(st.session_state):
         if key.startswith(("mapping_editor_", "wb_editor_")):
             st.session_state.pop(key, None)
@@ -503,6 +367,11 @@ def on_workbook_path_change():
     if not st.session_state.workbook_path.strip():
         st.session_state.workbook_path = str(INITIAL_XLSX)
     reset_workbook_ui_state()
+
+
+def on_match_config_change():
+    regenerate_match_cache()
+    st.rerun()
 
 
 with st.sidebar:
@@ -529,27 +398,9 @@ with st.sidebar:
         else:
             st.session_state.api = api
             st.rerun()
-    saved_at = snapshot_saved_at()
+    saved_at = store_updated_at()
     if saved_at:
         st.caption(f"本地存档更新时间：{saved_at}")
-
-    # 配票计算状态
-    _mt_cache_path = Path(sys.modules[MatchTicket.__module__].__file__).with_name(".json") / ".match_tickets" / ".matched_tickets_with_port_calls.json"
-    _mt_status_box = st.container(border=True)
-    with _mt_status_box:
-        st.caption("配票计算")
-        _mt_status_placeholder = st.empty()
-        if _mt_cache_path.is_file():
-            try:
-                _mt_cache = json.loads(_mt_cache_path.read_text(encoding="utf-8"))
-                _mt_updated = _mt_cache.get("updated_at", "")
-                if _mt_updated:
-                    _dt = datetime.fromisoformat(_mt_updated)
-                    _mt_status_placeholder.markdown(f"**{_dt.strftime('%Y-%m-%d %H:%M')}**")
-            except Exception:
-                pass
-        else:
-            _mt_status_placeholder.caption("尚未执行配票计算")
 
 tab_track, tab_chart, tab_manage = st.tabs(
     ["查询", "图表可视化", "数据管理"]
@@ -590,11 +441,15 @@ with sub_query:
                 value=date.today() + timedelta(days=60),
                 format="YYYY-MM-DD",
             )
+            _loading_code_default = {
+                "美湾": "US", "美西": "US", "巴西": "BR", "阿根廷": "ARG",
+            }.get(sheet_name, "BR")
             loading_text = pc4.text_input(
                 "装港国家码（两位码，逗号分隔，用于重名决胜）",
-                value="BR",
+                value=_loading_code_default,
+                key=f"pull_loading_{sheet_name}",
             )
-            window_df = Tool().read_initial_vessel_sheet(
+            window_df = Tool.read_initial_vessel_sheet(
                 initial_sheets[sheet_name],
                 pull_datetime_col,
                 str(pull_start),
@@ -603,7 +458,7 @@ with sub_query:
             window_names = tuple(sorted(
                 window_df["query_vessel_name"].dropna().astype(str).unique()
             )) if "query_vessel_name" in window_df.columns else ()
-            pull_mmsi = mmsis_for_names(window_names, snapshot_saved_at())
+            pull_mmsi = mmsis_for_names(window_names, store_updated_at())
             with st.container(border=True):
                 sc1, sc2 = st.columns(2)
                 sc1.caption("时间窗内船名")
@@ -616,12 +471,12 @@ with sub_query:
                 "拉取 MMSI 并写入存档",
                 type="primary",
                 width="stretch",
-                disabled=st.session_state.api is None or not pull_mmsi,
+                disabled=st.session_state.api is None or not window_names,
             )
             pull_progress = st.container()
 
         edit_df = st.data_editor(
-            mapping_view(sheet_name, snapshot_saved_at(), str(workbook_xlsx)),
+            mapping_view(sheet_name, store_updated_at(), str(workbook_xlsx)),
             key=f"mapping_editor_{sheet_name}",
             num_rows="dynamic",
             column_config={
@@ -636,14 +491,14 @@ with sub_query:
         if save_col.button("保存本表修改", type="primary", width="stretch"):
             entries = info_entries_from_editor(edit_df)
             try:
-                Store().save_items("info", entries)
+                Store().save("vessel_info", entries)
             except OSError as exc:
                 st.error(f"保存失败（存档文件可能被占用）：{exc}")
             except Exception as exc:
                 st.error(f"保存失败：{exc}")
             else:
                 mapping_view.clear()
-                clear_tracking_caches()
+                regenerate_match_cache()
                 st.success(f"已保存 {len(entries)} 个船名到本地存档")
                 st.rerun()
         if reset_col.button("放弃修改，重新加载", width="stretch"):
@@ -655,7 +510,7 @@ with sub_query:
                 collector = None
                 started = time.perf_counter()
                 try:
-                    pull_sheet = Tool().read_initial_vessel_sheet(
+                    pull_sheet = Tool.read_initial_vessel_sheet(
                         str(workbook_xlsx),
                         pull_datetime_col,
                         str(pull_start),
@@ -708,7 +563,7 @@ with sub_query:
                     st.error(f"查询失败，运行 {elapsed:.1f} 秒：{exc}")
                 else:
                     mapping_view.clear()
-                    clear_tracking_caches()
+                    regenerate_match_cache()
                     st.session_state.pop(f"mapping_editor_{sheet_name}", None)
                     st.success(
                         f"已写入存档（{len(names)} 个船名），运行 {elapsed:.1f} 秒"
@@ -724,53 +579,68 @@ with tab_track:
         st.info(f"初始船表路径无效或不是文件：{workbook_xlsx}")
     else:
         initial_sheets = load_initial_workbook(workbook_xlsx)
-        tc1, tc2, tc3, tc4 = st.columns(4)
+        tc1, tc2, tc3 = st.columns(3)
+        track_options = ["全部"] + list(initial_sheets.keys())
         track_name = tc1.selectbox(
-            "工作表", options=list(initial_sheets.keys()), key="track_sheet"
+            "工作表", options=track_options, key="track_sheet"
         )
-        initial_df = initial_sheets[track_name]
+        _is_all_track = track_name == "全部"
+        if _is_all_track:
+            initial_df = pd.concat(
+                initial_sheets.values(), ignore_index=True, sort=False
+            )
+        else:
+            initial_df = initial_sheets[track_name]
         start_date = tc2.date_input(
             "到港统计起始日期",
-            value=date.today() - timedelta(days=90),
+            value=date.today().replace(day=1),
             format="YYYY-MM-DD",
             key="track_start_date",
         )
         end_date = tc3.date_input(
             "到港统计截止日期",
-            value=date.today() + timedelta(days=60),
+            value=_month_end(date.today()),
             format="YYYY-MM-DD",
             key="track_end_date",
         )
-        country = tc4.text_input("到达统计国家码", value="CN", key="track_country")
 
-        _origin_days = {"美湾": 60, "美西": 25, "巴西": 48, "阿根廷": 60}
-        _default_days = _origin_days.get(track_name, 60)
+        ORIGIN_DEFAULT_DAYS = ORIGIN_DAYS.get(track_name, 60)
         if st.session_state.get("_prev_track_sheet") != track_name:
-            st.session_state["track_exp_days"] = _default_days
+            st.session_state["track_exp_days"] = ORIGIN_DEFAULT_DAYS
             st.session_state["_prev_track_sheet"] = track_name
-            # sheet改变时清除cache，确保重新生成
-            build_tracking_outputs.clear()
         with st.expander("航程天数设置"):
-            _oc1, _oc2 = st.columns(2)
-            datetime_col = _oc1.selectbox(
-                "日期列名", options=list(initial_df.columns),
-                index=list(initial_df.columns).index("departure") if "departure" in initial_df.columns else 0,
-                key="track_datetime_col",
-                help="用该列日期 + 航程天数作为估算到港日期"
+            _track_exp_col, _track_win_col = st.columns(2)
+            with _track_exp_col:
+                expected_shipping_days = st.number_input(
+                    "航程天数", min_value=0, key="track_exp_days",
+                    help=(
+                        "全部时按各表默认航程天数计算（美湾60/美西25/巴西48/阿根廷60）"
+                        if _is_all_track else "在日期列基础上加的天数"
+                    ),
+                    disabled=_is_all_track,
+                )
+            with _track_win_col:
+                outdated_eliminate_window = st.number_input(
+                    "航程超窗剔除（天）",
+                    min_value=0, value=90, key="track_outdated_window",
+                    help="原始离港到到港超过该天数则剔除；0 表示不过滤",
+                ) or None
+        if _is_all_track:
+            valid_mmsi = sorted({
+                m
+                for sn in initial_sheets
+                for m in sheet_mmsis(sn, store_updated_at(), str(workbook_xlsx))
+            })
+        else:
+            valid_mmsi = sheet_mmsis(
+                track_name, store_updated_at(), str(workbook_xlsx)
             )
-            expected_shipping_days = _oc2.number_input(
-                "航程天数", min_value=0, key="track_exp_days",
-                help="在日期列基础上加的天数"
-            )
-        valid_mmsi = sheet_mmsis(
-            track_name, snapshot_saved_at(), str(workbook_xlsx)
-        )
         if not valid_mmsi:
             st.warning("该工作表在存档中没有有效 MMSI，请先在 MMSI 查询页在线拉取或手工填写并保存。")
         with st.container(border=True):
             sc1, sc2 = st.columns(2)
             sc1.caption("本地存档更新时间")
-            sc1.markdown(f"**{snapshot_saved_at() or '无'}**")
+            sc1.markdown(f"**{store_updated_at() or '无'}**")
             sc2.caption("存档 MMSI 数")
             sc2.markdown(f"**{len(valid_mmsi)} 个 MMSI**")
 
@@ -798,13 +668,13 @@ with tab_track:
                 format="YYYY-MM-DD",
                 key="pull_data_end",
             )
-            window_df = Tool().read_initial_vessel_sheet(
+            window_df = Tool.read_initial_vessel_sheet(
                 initial_df, data_datetime_col, str(data_start), str(data_end)
             ).reset_index()
             window_names = tuple(sorted(
                 window_df["query_vessel_name"].dropna().astype(str).unique()
             )) if "query_vessel_name" in window_df.columns else ()
-            pull_mmsi = mmsis_for_names(window_names, snapshot_saved_at())
+            pull_mmsi = mmsis_for_names(window_names, store_updated_at())
             with st.container(border=True):
                 sc1, sc2, sc3 = st.columns(3)
                 sc1.caption("时间窗内船名")
@@ -812,8 +682,7 @@ with tab_track:
                 sc2.caption("对应 MMSI")
                 sc2.markdown(f"**{len(pull_mmsi)} 个 MMSI**")
                 sc3.caption("已查询存档")
-                from VesselProcessAPI.Store import Store
-                store_mmsis = set(Store()._registry["items"].get("mmsi", {}).get("data", []))
+                store_mmsis = archived_mmsis(store_updated_at())
                 archived_in_window = store_mmsis & set(pull_mmsi)
                 sc3.markdown(f"**{len(archived_in_window)} 个 MMSI**")
 
@@ -887,25 +756,41 @@ with tab_track:
                         elapsed = time.perf_counter() - started
                         st.error(f"拉取失败，运行 {elapsed:.1f} 秒：{exc}")
                     else:
-                        clear_tracking_caches()
+                        regenerate_match_cache()
                         st.success(
                             f"拉取完成，共 {len(pull_mmsi)} 艘船，运行 {elapsed:.1f} 秒"
                         )
                         st.rerun()
 
-        code = country.strip().upper() or "CN"
         with st.spinner("正在读取本地存档生成结果…"):
             try:
-                combined, current, by_mmsi = build_tracking_outputs(
-                    initial_df,
-                    str(start_date),
-                    str(end_date),
-                    code,
-                    snapshot_saved_at(),
-                    datetime_col,
-                    expected_shipping_days,
-                    sheet_name=track_name,
-                )
+                present = Present()
+                if _is_all_track:
+                    sheet_days = {sn: ORIGIN_DAYS.get(sn, 60) for sn in initial_sheets}
+                    combined = _gqs_multi(
+                        str(start_date), str(end_date),
+                        sheet_days=sheet_days,
+                        outdated_eliminate_window=outdated_eliminate_window,
+                    )[0]
+                else:
+                    combined = _gqs_multi(
+                        str(start_date), str(end_date),
+                        expected_shipping_days=expected_shipping_days,
+                        sheet_name=track_name,
+                        outdated_eliminate_window=outdated_eliminate_window,
+                    )[0]
+                if combined.empty:
+                    current = pd.DataFrame()
+                else:
+                    mmsis = (
+                        set(combined["mmsi"].dropna().astype(str))
+                        if "mmsi" in combined.columns else set()
+                    )
+                    current = present.current_situation
+                    if mmsis and "mmsi" in current.columns:
+                        current = current[
+                            current["mmsi"].astype(str).isin(mmsis)
+                        ].reset_index(drop=True)
             except Exception as exc:
                 st.exception(exc)
             else:
@@ -916,170 +801,101 @@ with tab_track:
                     ]
                 )
                 with sub_combine:
-                    # 所有指标按船名去重, 一船一状态; 多行业务行/多候选不重复计数
-                    if "status" in combined.columns:
-                        name_status = (
-                            combined.drop_duplicates("query_vessel_name")
-                            .set_index("query_vessel_name")["status"]
+                    # 指标直接聚合 combined: 船数按船名一行, 阶段/吨位只计 unique
+                    by_name = combined.drop_duplicates("query_vessel_name")
+                    if "status" in by_name.columns:
+                        status_vc = by_name["status"].value_counts()
+                        multi_names = sorted(
+                            by_name.loc[by_name["status"] == "multiple", "query_vessel_name"]
                         )
+                        n_unique = int(status_vc.get("unique", 0))
+                        n_multiple = int(status_vc.get("multiple", 0))
                     else:
-                        name_status = pd.Series(
-                            pd.NA,
-                            index=pd.Index(
-                                combined["query_vessel_name"]
-                                .dropna().astype(str).drop_duplicates()
-                            ),
-                        )
-                    # combined 已在 Presentation 层过滤:
-                    # 窗口内首次到港命中的 unique/multiple + 全部 not_found
-                    all_names = set(name_status.index)
-                    unique_names = set(name_status[name_status == "unique"].index)
-                    multiple_names = set(name_status[name_status == "multiple"].index)
-                    unmatched_names = all_names - unique_names - multiple_names
-                    cohort_names = all_names
-
-                    eta_fields = {"etbStd", "etb", "etaStd", "eta"}
-                    anchor_fields = {"atAnchorA", "atAnchorArrival"}
-                    if "arrival_time" not in combined.columns:
-                        arrived = pd.DataFrame(
-                            columns=["arrival_source", "departure_time"]
-                        )
-                    else:
-                        arrived = combined[
-                            combined["arrival_time"].notna()
-                        ].drop_duplicates("query_vessel_name").set_index(
-                            "query_vessel_name"
-                        )
-                    # 阶段分桶只针对 unique; multiple 候选不进事实桶
-                    # 歧义船候选的到港仅作提示, 不计入事实分桶
-                    multi_arrived = sorted(multiple_names)
-
-                    phase = {}
-                    for n in unique_names:
-                        row = arrived.loc[n]
-                        source, departure = row["arrival_source"], row["departure_time"]
-                        if source == "estimated":
-                            phase[n] = "估算到港"
-                        elif source in eta_fields:
-                            phase[n] = "在途 ETA"
-                        elif pd.notna(departure) or source in ("atBerthA", "atBerthArrival"):
-                            phase[n] = "靠泊"
-                        elif source in anchor_fields:
-                            phase[n] = "锚泊"
-                        else:
-                            phase[n] = "港界待靠"
-                    counts = pd.Series(phase).value_counts()
-                    n_phase = lambda k: int(counts.get(k, 0))
+                        multi_names = []
+                        n_unique = n_multiple = 0
+                    n_names = len(by_name)
+                    uniq_names = (
+                        by_name[by_name["status"] == "unique"]
+                        if "status" in by_name.columns else by_name
+                    )
 
                     a1, a2, a3, a4 = st.columns(4)
                     a1.metric(
-                        "窗口内查询船数", len(cohort_names),
-                        help=(f"首次靠泊 {code} 的时间落在 "
+                        "窗口内查询船数", n_names,
+                        help=(f"首次靠泊 {st.session_state.arrival_country} 的时间落在 "
                               f"{start_date} ~ {end_date} 内的 unique/multiple 船，"
                               f"另含全部 not_found 船名"),
                     )
                     a2.metric(
-                        "唯一匹配 unique", len(unique_names),
+                        "唯一匹配 unique", n_unique,
                         help="窗口队列中船名查询唯一命中 MMSI 的船，下排到港阶段仅统计这些船",
                     )
                     a3.metric(
-                        "重名歧义 multiple", len(multiple_names),
-                        delta=(f"{len(multi_arrived)} 个候选窗口内有到港"
-                               if multi_arrived else None),
+                        "重名歧义 multiple", n_multiple,
+                        delta=(f"{n_multiple} 个候选窗口内有到港"
+                               if multi_names else None),
                         help=("两个候选 MMSI 未消歧，候选到港不计入下方统计；"
                               "请在 MMSI 查询页核实并改为 unique。"
-                              + (f"涉及：{', '.join(multi_arrived)}"
-                                 if multi_arrived else "")),
+                              + (f"涉及：{', '.join(multi_names)}"
+                                 if multi_names else "")),
                     )
                     a4.metric(
-                        "未匹配", len(unmatched_names),
+                        "未匹配", n_names - n_unique - n_multiple,
                         help="not_found 船名：无 MMSI，始终保留在结果中",
                     )
 
-                    st.markdown(f"**窗口内唯一匹配（unique）：共 {len(unique_names)} 艘**")
-                    b1, b2, b3, b4, b5 = st.columns(5)
-                    b1.metric(
-                        "靠泊",
-                        n_phase("靠泊"),
-                        help="首次挂靠已靠泊 (atBerth) 的船，含已有离港时间和尚在卸货的船",
+                    st.markdown(f"**窗口内唯一匹配（unique）：共 {len(uniq_names)} 艘**")
+                    phase_vc = (
+                        uniq_names["phase"].dropna().value_counts()
+                        if "phase" in uniq_names.columns
+                        else pd.Series(dtype="int64")
                     )
-                    b2.metric(
-                        "锚泊", n_phase("锚泊"),
-                        help="首次挂靠仅到锚地 (atAnchor*) 尚未靠泊",
+                    phase_helps = (
+                        "首次挂靠命中 atBerth* 的船",
+                        "首次挂靠仅到锚地 (atAnchor*) 尚未靠泊",
+                        "回溯数据内无实际挂靠，按 AIS ETB/ETA 预计窗口内到达",
+                        "ETA 过滤为 low 时，按初始船表日期 + 航程天数估算",
                     )
-                    b3.metric(
-                        "港界待靠", n_phase("港界待靠"),
-                        help="首次挂靠仅到港界 (ata/atPortArrival) 尚未锚泊/靠泊",
-                    )
-                    b4.metric(
-                        "在途 ETA", n_phase("在途 ETA"),
-                        help="回溯数据内无实际挂靠，按 AIS ETB/ETA 预计窗口内到达",
-                    )
-                    b5.metric(
-                        "估算到港", n_phase("估算到港"),
-                        help="ETA 过滤为 low 时，按初始船表日期 + 航程天数估算",
-                    )
+                    for col, key, tip in zip(
+                        st.columns(4), ARRIVAL_PHASE_ORDER, phase_helps
+                    ):
+                        col.metric(key, int(phase_vc.get(key, 0)), help=tip)
 
-                    # 到货量: 初始表 quantity 列可能是带千分位的文本, 按船名汇总
-                    # 多票货业务行后再归入该船唯一的到港阶段; multiple/未匹配不计
-                    if "quantity" in combined.columns:
-                        combined_unique = combined[combined["status"] == "unique"] if "status" in combined.columns else combined
-                        qty_num = pd.to_numeric(
-                            combined_unique["quantity"].astype(str)
-                            .str.replace(",", "", regex=False)
-                            .str.strip(),
-                            errors="coerce",
-                        ).fillna(0.0)
-                        qty_by_name = (
-                            qty_num.groupby(combined_unique["query_vessel_name"].astype(str))
-                            .sum()
+                    # 到货量: unique 业务行按 phase 直接 groupby; multiple/未匹配不计
+                    if "quantity" in combined.columns and "phase" in combined.columns:
+                        uniq_rows = (
+                            combined[combined["status"] == "unique"]
+                            if "status" in combined.columns else combined
                         )
-                        phase_order = [
-                            "靠泊", "锚泊",
-                            "港界待靠", "在途 ETA", "估算到港",
-                        ]
+                        phase_qty = uniq_rows.groupby("phase")["quantity"].sum()
                         tonnage = {
-                            k: float(sum(
-                                qty_by_name.get(n, 0.0)
-                                for n, ph in phase.items() if ph == k
-                            ))
-                            for k in phase_order
+                            k: float(phase_qty.get(k, 0.0))
+                            for k in ARRIVAL_PHASE_ORDER
                         }
-                        total_tonnage = sum(tonnage.values())
                         st.markdown("**到货量统计：**")
-                        st.metric("总计", f"{total_tonnage:,.0f} 吨")
-                        d1, d2, d3, d4, d5 = st.columns(5)
-                        for col, key in zip(
-                            (d1, d2, d3, d4, d5), phase_order
-                        ):
+                        st.metric("总计", f"{sum(tonnage.values()):,.0f} 吨")
+                        for col, key in zip(st.columns(4), ARRIVAL_PHASE_ORDER):
                             col.metric(
                                 key, f"{tonnage[key]:,.0f} 吨",
                                 help=f"{key}船对应初始船表 quantity 之和",
                             )
                     with st.expander("到港明细（点击展开）"):
-                        show_cols = [
-                            c for c in [
-                                "query_vessel_name", "departure", "departure_from_origin_port", "port_name",
-                                "quantity", "status", "mmsi", "shipType",
-                                "port_name_cn", "port_en", "arrival_time",
-                                "departure_time", "arrival_source",
-                            ] if c in combined.columns
-                        ]
-                        display_df = combined[show_cols]
-                        st.dataframe(display_df, width="stretch")
+                        st.dataframe(combined, width="stretch")
                         st.download_button(
                             "下载到港记录 CSV",
-                            csv_bytes(display_df),
+                            csv_bytes(combined),
                             file_name="combined_vessel_sheet.csv",
                             mime="text/csv",
                         )
                 with sub_current:
-                    name_by_mmsi = {}
-                    for m, entry in by_mmsi.items():
-                        ais = entry.get("ais") or {}
-                        name_by_mmsi[str(m)] = (
-                            ais.get("nameEn") or ais.get("aisName") or str(m)
+                    ais_items = Store().load("ais")
+                    name_by_mmsi = {
+                        str(m): (
+                            entry.get("nameEn") or entry.get("aisName") or str(m)
                         )
+                        if isinstance(entry, dict) else str(m)
+                        for m, entry in ais_items.items()
+                    }
                     option_mmsis = sorted(name_by_mmsi)
                     selection_key = "route_selection"
                     st.session_state[selection_key] = [
@@ -1111,12 +927,12 @@ with tab_track:
                     if not selected:
                         st.info("未选择任何船舶，请在上方搜索框中选择后查看轨迹。")
                     else:
-                        subset = {m: by_mmsi[m] for m in selected}
                         with st.spinner("正在渲染地图…"):
                             map_html = render_route_map(
-                                subset, snapshot_saved_at()
+                                selected, store_updated_at()
                             )
                         st.caption(
+                            "绿标=起点，红标=历史终点，蓝旗=AIS 当前位置；"
                             "实线为历史轨迹，同色虚线为官方预测航线或到目的港直线。"
                         )
                         st.iframe(map_html, height=680)
@@ -1144,66 +960,45 @@ with tab_chart:
         st.info(f"初始船表路径无效或不是文件：{workbook_xlsx}")
     else:
         chart_sheets = load_initial_workbook(workbook_xlsx)
-        cc1, cc2 = st.columns(2)
         sheet_options = ["全部"] + list(chart_sheets.keys())
-        chart_sheet_name = cc1.selectbox(
+        chart_sheet_name = st.selectbox(
             "工作表", options=sheet_options, key="chart_sheet"
         )
-        chart_country = cc2.text_input("到达统计国家码", value="CN", key="chart_country")
 
-        _origin_days_c = {"美湾": 60, "美西": 25, "巴西": 48, "阿根廷": 60}
-        _chart_default = _origin_days_c.get(chart_sheet_name, 60)
+        ORIGIN_DEFAULT_DAYS_C = ORIGIN_DAYS.get(chart_sheet_name, 60)
         _is_all_sheets = (chart_sheet_name == "全部")
         if st.session_state.get("_prev_chart_sheet") != chart_sheet_name:
-            st.session_state["chart_exp_days"] = _chart_default
+            st.session_state["chart_exp_days"] = ORIGIN_DEFAULT_DAYS_C
             st.session_state["_prev_chart_sheet"] = chart_sheet_name
-            # sheet改变时清除图表相关的cache
         with st.expander("航程天数设置"):
-            _cc1, _cc2 = st.columns(2)
-            chart_datetime_col_options = list(chart_sheets[chart_sheet_name].columns) if not _is_all_sheets else []
-            
-            # 当选择"全部"时，使用第一个sheet的列作为参考
-            if _is_all_sheets and chart_sheets:
-                first_sheet_cols = list(list(chart_sheets.values())[0].columns)
-                chart_datetime_col = _cc1.selectbox(
-                    "日期列名", options=first_sheet_cols,
-                    index=first_sheet_cols.index("departure") if "departure" in first_sheet_cols else 0,
-                    key="chart_datetime_col",
-                    help="用该列日期 + 航程天数作为估算到港日期",
+            _chart_exp_col, _chart_win_col = st.columns(2)
+            with _chart_exp_col:
+                chart_exp_days = st.number_input(
+                    "航程天数", min_value=0, key="chart_exp_days",
+                    help="在日期列基础上加的天数",
                     disabled=_is_all_sheets,
                 )
-            else:
-                chart_datetime_col = _cc1.selectbox(
-                    "日期列名", options=chart_datetime_col_options,
-                    index=chart_datetime_col_options.index("departure") if not _is_all_sheets and "departure" in chart_datetime_col_options else 0,
-                    key="chart_datetime_col",
-                    help="用该列日期 + 航程天数作为估算到港日期",
-                    disabled=_is_all_sheets,
-                )
-            chart_exp_days = _cc2.number_input(
-                "航程天数", min_value=0, key="chart_exp_days",
-                help="在日期列基础上加的天数",
-                disabled=_is_all_sheets,
-            )
+            with _chart_win_col:
+                chart_outdated_window = st.number_input(
+                    "航程超窗剔除（天）",
+                    min_value=0, value=90, key="chart_outdated_window",
+                    help="原始离港到到港超过该天数则剔除；0 表示不过滤",
+                ) or None
         if chart_sheet_name == "全部":
-            chart_df_input = pd.concat(
-                chart_sheets.values(), ignore_index=True
-            )
             all_mmsis = set()
             for sn in chart_sheets:
                 all_mmsis.update(
-                    sheet_mmsis(sn, snapshot_saved_at(), str(workbook_xlsx))
+                    sheet_mmsis(sn, store_updated_at(), str(workbook_xlsx))
                 )
             chart_mmsi = sorted(all_mmsis)
         else:
-            chart_df_input = chart_sheets[chart_sheet_name]
             chart_mmsi = sheet_mmsis(
-                chart_sheet_name, snapshot_saved_at(), str(workbook_xlsx)
+                chart_sheet_name, store_updated_at(), str(workbook_xlsx)
             )
         with st.container(border=True):
             sc1, sc2 = st.columns(2)
             sc1.caption("本地存档更新时间")
-            sc1.markdown(f"**{snapshot_saved_at() or '无'}**")
+            sc1.markdown(f"**{store_updated_at() or '无'}**")
             sc2.caption("存档 MMSI 数")
             sc2.markdown(f"**{len(chart_mmsi)} 个 MMSI**")
 
@@ -1212,41 +1007,27 @@ with tab_chart:
         _sheet_configs = None
         if _is_all_sheets:
             _sheet_configs = tuple(
-                (df, "departure", _origin_days_c.get(name, 60), name)
+                (df, "departure", ORIGIN_DAYS.get(name, 60), name)
                 for name, df in chart_sheets.items()
             )
 
-        # 统一预计算一次配票（同一 snapshot 不重复计算）
-        _code = chart_country.strip().upper() or "CN"
-        _snap = snapshot_saved_at()
-        _xlsx_mtime = workbook_xlsx.stat().st_mtime if workbook_xlsx.is_file() else 0
-        _precompute_key = (_code, _snap, _xlsx_mtime)
-        _need_precompute = st.session_state.get("_last_precompute_key") != _precompute_key
-        if _need_precompute:
-            _mt_status_placeholder.caption("正在计算配票…")
+        arrival_df, monthly_agg, weekly_agg = _get_arrival_df_for_chart(
+            _sheet_configs,
+            chart_exp_days, chart_sheet_name if not _is_all_sheets else None,
+            outdated_eliminate_window=chart_outdated_window,
+        )
 
         with chart_sub_time:
-            weekly = weekly_arrival_tonnage(
-                chart_df_input,
-                _code,
-                _snap,
-                chart_datetime_col,
-                chart_exp_days,
-                _sheet_configs,
-                skip_precompute=not _need_precompute,
-            )
-            if _need_precompute:
-                _mt_status_placeholder.caption("配票计算完成")
-                st.session_state["_last_precompute_key"] = _precompute_key
-            if weekly.empty:
+            if arrival_df.empty:
                 st.info("暂无可用于周度图的 unique 到港数据。")
             else:
                 granularity = st.radio(
                     "时间粒度", options=["周度", "月度"], horizontal=True
                 )
                 available_years = sorted(
-                    set(weekly["year"].unique())
-                    | set(weekly["cal_year"].unique()),
+                    set(weekly_agg["week_year"].unique())
+                    | set(monthly_agg["cal_year"].unique())
+                    | set(arrival_df["cal_year"].unique()),
                     reverse=True,
                 )
                 chart_years = st.multiselect(
@@ -1279,16 +1060,16 @@ with tab_chart:
                             st.warning("请至少选择一个到港阶段。")
                         period_label = "周次（周六–周五）"
                         x_label = "周次（周六开始，周五结束，每年 52 周）"
-                        week_rows = weekly[weekly["year"].isin(chart_years)]
+                        week_rows = weekly_agg[weekly_agg["week_year"].isin(chart_years)]
                         if selected_phases:
                             week_rows = week_rows[
                                 week_rows["phase"].isin(selected_phases)
                             ]
                         pivot = (
                             week_rows.pivot_table(
-                                index="week",
-                                columns="year",
-                                values="quantity",
+                                index="week_num",
+                                columns="week_year",
+                                values="quantity_sum",
                                 aggfunc="sum",
                                 fill_value=0,
                             )
@@ -1297,7 +1078,7 @@ with tab_chart:
                         )
                         pivot.columns = [int(y) for y in pivot.columns]
                         chart_df = pivot.reset_index().rename(
-                            columns={"week": period_label}
+                            columns={"week_num": period_label}
                         )
                         rows = []
                         for yr in pivot.columns:
@@ -1322,14 +1103,14 @@ with tab_chart:
                         x_label = "月份"
                         # 月度按 arrival_time 所在自然月汇总, 与查询页所选
                         # 日期窗口的到货量统计同口径 (不用周六周起始日定月)
-                        month_rows = weekly[
-                            weekly["cal_year"].isin(chart_years)
+                        month_rows = monthly_agg[
+                            monthly_agg["cal_year"].isin(chart_years)
                         ]
                         pivot = (
                             month_rows.pivot_table(
                                 index="cal_month",
                                 columns="cal_year",
-                                values="quantity",
+                                values="quantity_sum",
                                 aggfunc="sum",
                                 fill_value=0,
                             )
@@ -1455,21 +1236,21 @@ with tab_chart:
                     # 当前期 (月度=当前自然月, 周度=今天所在周六–周五周) 的
                     # 到货量结构: 单条横向堆叠 bar, 按到港阶段拆五段
                     if granularity == "月度":
-                        current_rows = weekly[
-                            (weekly["cal_year"] == today.year)
-                            & (weekly["cal_month"] == today.month)
+                        current_rows = monthly_agg[
+                            (monthly_agg["cal_year"] == today.year)
+                            & (monthly_agg["cal_month"] == today.month)
                         ]
                         current_label = f"{today.year}年{today.month}月"
                     else:
-                        cur_week = custom_saturday_weeks(
+                        cur_week = calculate_week_number(
                             pd.Series([today])
                         ).iloc[0]
-                        current_rows = weekly[
-                            (weekly["year"] == int(cur_week["year"]))
-                            & (weekly["week"] == int(cur_week["week"]))
+                        current_rows = weekly_agg[
+                            (weekly_agg["week_year"] == int(cur_week["week_year"]))
+                            & (weekly_agg["week_num"] == int(cur_week["week_num"]))
                         ]
                         current_label = (
-                            f"{int(cur_week['year'])}年第{int(cur_week['week'])}周"
+                            f"{int(cur_week['week_year'])}年第{int(cur_week['week_num'])}周"
                             f"（{cur_week['week_start']:%m-%d}~"
                             f"{cur_week['week_end']:%m-%d}）"
                         )
@@ -1479,9 +1260,9 @@ with tab_chart:
                     else:
                         phase_df = current_rows.copy()
                         phase_sum = (
-                            phase_df.groupby("phase")["quantity"].sum()
+                            phase_df.groupby("phase")["quantity_sum"].sum()
                             .reindex(ARRIVAL_PHASE_ORDER, fill_value=0.0)
-                            .reset_index()
+                            .reset_index(name="quantity")
                         )
                         current_total = float(phase_sum["quantity"].sum())
                         st.metric("当前期到货量合计", f"{current_total:,.0f} 吨")
@@ -1522,15 +1303,12 @@ with tab_chart:
                         )
 
         with chart_sub_port:
-            granular_data = arrival_by_port_granular(
-                chart_df_input,
-                chart_country.strip().upper() or "CN",
-                snapshot_saved_at(),
-                chart_datetime_col,
-                chart_exp_days,
-                _sheet_configs,
-                skip_precompute=True,
-            )
+            if arrival_df.empty or "port_name_cn" not in arrival_df.columns:
+                granular_data = pd.DataFrame()
+            else:
+                granular_data = arrival_df[["port_name_cn", "week_year", "week_num", "cal_month", "quantity"]].rename(
+                    columns={"cal_month": "month"}
+                ).copy()
             if granular_data.empty:
                 st.info("暂无可用于港口统计的到港数据。")
             else:
@@ -1571,36 +1349,36 @@ with tab_chart:
                 )
 
                 _today = pd.Timestamp.now().normalize()
-                _cur_week_info = custom_saturday_weeks(pd.Series([_today])).iloc[0]
-                _cur_year = int(_cur_week_info["year"])
-                _cur_week = int(_cur_week_info["week"])
+                _cur_week_info = calculate_week_number(pd.Series([_today])).iloc[0]
+                _cur_year = int(_cur_week_info["week_year"])
+                _cur_week = int(_cur_week_info["week_num"])
                 _cur_month = int(_today.month)
 
                 if port_granularity == "周度":
-                    available_years = sorted(granular_data["year"].unique().tolist(), reverse=True)
+                    available_years = sorted(granular_data["week_year"].unique().tolist(), reverse=True)
                     _default_idx_y = available_years.index(_cur_year) if _cur_year in available_years else 0
                     sel_year = st.selectbox("选择年份", options=available_years, index=_default_idx_y, key="port_sel_year_w")
-                    year_data = granular_data[granular_data["year"] == sel_year]
-                    available_weeks = sorted(year_data["week"].unique().tolist())
+                    year_data = granular_data[granular_data["week_year"] == sel_year]
+                    available_weeks = sorted(year_data["week_num"].unique().tolist())
                     _default_idx_w = available_weeks.index(_cur_week) if _cur_week in available_weeks else 0
                     sel_week = st.selectbox("选择周次", options=available_weeks, index=_default_idx_w, key="port_sel_week")
-                    plot_data = year_data[year_data["week"] == sel_week]
+                    plot_data = year_data[year_data["week_num"] == sel_week]
                     period_label = f"{sel_year}年第{sel_week}周"
                 elif port_granularity == "月度":
-                    available_years = sorted(granular_data["year"].unique().tolist(), reverse=True)
+                    available_years = sorted(granular_data["week_year"].unique().tolist(), reverse=True)
                     _default_idx_y = available_years.index(_cur_year) if _cur_year in available_years else 0
                     sel_year = st.selectbox("选择年份", options=available_years, index=_default_idx_y, key="port_sel_year_m")
-                    year_data = granular_data[granular_data["year"] == sel_year]
+                    year_data = granular_data[granular_data["week_year"] == sel_year]
                     available_months = sorted(year_data["month"].unique().tolist())
                     _default_idx_m = available_months.index(_cur_month) if _cur_month in available_months else 0
                     sel_month = st.selectbox("选择月份", options=available_months, index=_default_idx_m, key="port_sel_month")
                     plot_data = year_data[year_data["month"] == sel_month]
                     period_label = f"{sel_year}年{sel_month}月"
                 else:
-                    available_years = sorted(granular_data["year"].unique().tolist(), reverse=True)
+                    available_years = sorted(granular_data["week_year"].unique().tolist(), reverse=True)
                     _default_idx_y = available_years.index(_cur_year) if _cur_year in available_years else 0
                     sel_year = st.selectbox("选择年份", options=available_years, index=_default_idx_y, key="port_sel_year_y")
-                    plot_data = granular_data[granular_data["year"] == sel_year]
+                    plot_data = granular_data[granular_data["week_year"] == sel_year]
                     period_label = f"{sel_year}年"
 
                 agg_df = (
@@ -1658,9 +1436,10 @@ with sub_data:
         key="workbook_path",
         on_change=on_workbook_path_change,
     )
-    st.caption(
-        "每个工作表必须包含 `query_vessel_name`；"
-        "建议包含 `departure`（默认时间窗列）和 `quantity`（到货量统计/图表）。"
+    st.text_input(
+        "到达统计国家码",
+        value=st.session_state.get("arrival_country", "CN"),
+        key="arrival_country",
     )
     workbook_xlsx = current_workbook_path()
     workbook_disk = None
@@ -1681,6 +1460,40 @@ with sub_data:
             wb_names = list(st.session_state.wb_edited.keys())
 
     if workbook_disk is not None:
+        all_cols = list(dict.fromkeys(
+            c for df in workbook_disk.values() for c in df.columns
+        ))
+        mv_col, dep_col = st.columns(2)
+        with mv_col:
+            st.number_input(
+                "配票航程上界（天）",
+                min_value=0, value=90, key="max_voyage_days",
+                on_change=on_match_config_change,
+                help=(
+                    "配票时只接受 0 < 到港−离港 ≤ 该天数的挂靠；"
+                    "超窗挂靠不消费，留给离港更晚的票。"
+                    "0=不限制。改动后自动重算配票缓存。"
+                    "与跟踪/图表页「航程超窗剔除」独立（后者只过滤查询结果）。"
+                ),
+            )
+        with dep_col:
+            if all_cols:
+                if st.session_state.get("departure_col") not in all_cols:
+                    st.session_state.departure_col = (
+                        "departure" if "departure" in all_cols else all_cols[0]
+                    )
+                st.selectbox(
+                    "配票离港时间列（departure_from_origin_port）",
+                    options=all_cols,
+                    key="departure_col",
+                    on_change=on_match_config_change,
+                    help="写入配票结果的离港时间；改动后自动重算配票缓存。",
+                )
+        st.caption(
+            "每个工作表必须包含 `query_vessel_name`；"
+            "建议包含 `quantity`（到货量统计/图表）。"
+            "离港时间列与航程上界用于配票缓存，改动后自动重算。"
+        )
         edit_sheet = st.selectbox("选择要编辑的工作表", options=wb_names)
         edited_df = st.data_editor(
             st.session_state.wb_edited[edit_sheet],
@@ -1721,7 +1534,7 @@ with sub_data:
         api = st.session_state.api
         (api.delete(names) if api is not None else Store().delete(names))
 
-    info_entries = Store().load_info()
+    info_entries = Store().load("vessel_info")
     if info_entries:
         st.caption(f"存档内共 {len(info_entries)} 个船名查询结果，可多选删除。")
         del_names = st.multiselect(
@@ -1731,7 +1544,7 @@ with sub_data:
         )
         if st.button("删除选中船名", type="primary", disabled=not del_names):
             delete_store(del_names)
-            clear_tracking_caches()
+            regenerate_match_cache()
             st.success(f"已删除 {len(del_names)} 个船名及相关船舶数据")
             st.rerun()
     else:
@@ -1741,6 +1554,6 @@ with sub_data:
     confirm_wipe = st.checkbox("我确认清空全部本地存档（不可恢复）")
     if st.button("清空全部存档", disabled=not confirm_wipe):
         delete_store(None)
-        clear_tracking_caches()
+        regenerate_match_cache()
         st.success("本地存档已清空")
         st.rerun()

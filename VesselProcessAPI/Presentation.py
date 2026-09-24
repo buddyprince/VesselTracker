@@ -1,17 +1,14 @@
 from typing import TYPE_CHECKING
 import json
-import logging
 from pathlib import Path
 
 import pandas as pd
 
 if TYPE_CHECKING:  # 仅类型检查时导入, 运行时不执行, 切断循环
     import folium
-    from .Freightower import FreightowerAPI
 from .MatchTicket import MatchTicket
 from .Store import Store
-
-log = logging.getLogger(__name__)
+from .Tool import Tool
 
 
 class Present:
@@ -20,16 +17,11 @@ class Present:
     """
     def __init__(
         self,
-        api: "FreightowerAPI | None" = None,
-        save_returns: "str | None" = None,
         matched_tickets_with_port_calls: "str | None" = None,
     ):
         """
         将JSON转换为DataFrame展示
         Args:
-            api(FreightowerAPI): 直接接收类, 按其本批 mmsi 现场拼装展示视图
-            save_returns: 存档目录 (.saved_returns) 路径, 默认包内目录;
-                API 属性缺失或为空时回退读取该分片存档
             matched_tickets_with_port_calls: 配票缓存 JSON 文件路径,
                 默认 .json/.match_tickets/.matched_tickets_with_port_calls.json
         """
@@ -39,72 +31,34 @@ class Present:
             self._matched_tickets_path = (
                 Path(__file__).with_name(".json") / ".match_tickets" / ".matched_tickets_with_port_calls.json"
             )
-        if api is not None:
-            # 船名查询视图直接取 info 块; 宽表按本批 mmsi 从 5 个分块现场拼装
-            self._returns_by_vessel_name = dict(api._items["info"])
-            mmsi_list = list(api._mmsi_for_search)
-            self._returns_by_mmsi = {m: {"mmsi": m} for m in mmsi_list}
-            for key in Store.MMSI_KEYED:
-                section = api._items[key]
-                for m in mmsi_list:
-                    if m in section:
-                        self._returns_by_mmsi[m][key] = section[m]
-        else:
-            self._returns_by_mmsi = {}
-            self._returns_by_vessel_name = {}
-        if not self._returns_by_mmsi or not self._returns_by_vessel_name:
-            # API 缺失/为空 (或无参调用) 时回退到分片存档
-            try:
-                store = Store(save_returns) if save_returns else Store()
-                snapshot = store.load_snapshot()
-                print(f'读取存储，时间戳：{snapshot.get("saved_at")}')
-            except OSError as e:
-                log.warning(f"读取分片存档失败: {e}")
-                snapshot = {}
-            if not self._returns_by_mmsi:
-                self._returns_by_mmsi = snapshot.get("returns_by_mmsi") or {}
-            if not self._returns_by_vessel_name:
-                self._returns_by_vessel_name = snapshot.get("returns_by_vessel_name") or {}
 
     @property
-    def returns_by_vessel_name(self) -> dict:
-        """只读船名查询视图 {船名: {status, info}}。"""
-        return self._returns_by_vessel_name
-
-    @property
-    def returns_by_mmsi(self) -> dict:
-        """只读宽表视图 {mmsi: {mmsi, ais, current_port, ...}}。"""
-        return self._returns_by_mmsi
-
-    @property
-    def get_info_by_vessel_name(self) -> pd.DataFrame:
-        """委托 MatchTicket.get_info_df 生成船名查询表（带缓存）。"""
-        return MatchTicket().get_info_df()
-
-    def _read_from_search_returns(self, key: str) -> pd.DataFrame:
-        """从 search 结果取每个船的键展平成行。
-
-        dict (如 ais) 取一条; list (如 current_port/history_route) 逐条展开;
-        无数据的船补一行仅含 mmsi 的空记录。
-        """
-        result: dict[str, dict] = self._returns_by_mmsi
-        rows = []
-        for mmsi, entry in result.items():
-            val = entry.get(key)
-            if isinstance(val, list):
-                if val:
-                    rows.extend({"mmsi": mmsi, **item} for item in val)
-                else:
-                    rows.append({"mmsi": mmsi})
-            else:
-                rows.append(val or {"mmsi": mmsi})
-        return pd.DataFrame(rows)
+    def get_vessel_info_df(self) -> pd.DataFrame:
+        """委托 MatchTicket.get_vessel_info_df 生成船名查询表（带缓存）。"""
+        return MatchTicket().get_vessel_info_df()
 
     @property
     def current_situation(self) -> pd.DataFrame:
         """合并每艘船的 ais 与 current_port 全部列, 按 mmsi 左连接。"""
-        ais = self._read_from_search_returns('ais')
-        current_port = self._read_from_search_returns('current_port')
+        store = Store()
+
+        def flat(data: dict) -> pd.DataFrame:
+            rows = []
+            for mmsi, val in data.items():
+                if isinstance(val, list):
+                    if val:
+                        rows.extend({"mmsi": mmsi, **item} for item in val)
+                    else:
+                        rows.append({"mmsi": mmsi})
+                else:
+                    rows.append(val or {"mmsi": mmsi})
+            if not rows:
+                return pd.DataFrame(columns=["mmsi"])
+            return pd.DataFrame(rows)
+
+        ais = Tool.ensure_columns(flat(store.load("ais")), ["mmsi"])
+        current_port = Tool.ensure_columns(
+            flat(store.load("current_port")), ["mmsi"])
         ais["mmsi"] = ais["mmsi"].astype(str)
         current_port["mmsi"] = current_port["mmsi"].astype(str)
         return ais.merge(current_port, on="mmsi", how="left", suffixes=("", "_port"))
@@ -117,10 +71,11 @@ class Present:
             end: str,
             expected_shipping_days: "int | None" = None,
             sheet_name=None,
+            outdated_eliminate_window: "int | None" = 90,
         ):
         """读取缓存的配票结果，补算 estimated arrival_time，返回窗口内命中的业务行。
 
-        流程: 读取缓存 -> 补算 estimated arrival_time -> 窗口过滤。
+        流程: 读取缓存 -> 补算 estimated arrival_time -> 航程超窗过滤 -> 窗口过滤。
         缓存格式: ``{"updated_at": ISO时间戳, "items": {... 按 sheet_name 分键 ...}}``。
 
         Args:
@@ -128,6 +83,8 @@ class Present:
             end: 统计窗口截止日期。
             expected_shipping_days: 估算航程天数，None 时不估算。
             sheet_name: 工作表名，用于从缓存中读取对应 sheet 的配票。None 时向兼容平铺格式。
+            outdated_eliminate_window: 原始离港到到港超过该天数则剔除；None 或
+                <=0 不过滤。默认 90 天。
 
         Returns:
             窗口内命中的业务行。
@@ -159,6 +116,20 @@ class Present:
                 + pd.Timedelta(days=expected_shipping_days)
             )
 
+        # 航程超窗剔除: arrival_time - departure_from_origin_port > N 天
+        if outdated_eliminate_window and outdated_eliminate_window > 0:
+            if (
+                "arrival_time" in result.columns
+                and "departure_from_origin_port" in result.columns
+            ):
+                voyage_days = (
+                    result["arrival_time"] - result["departure_from_origin_port"]
+                ).dt.days
+                not_outdated = voyage_days.le(int(outdated_eliminate_window))
+                # 只剔除明确超窗的, NaT 保留
+                not_outdated = not_outdated | voyage_days.isna()
+                result = result[not_outdated]
+
         # 窗口过滤
         in_window = (
             result["arrival_time"].ge(start_ts)
@@ -166,17 +137,15 @@ class Present:
         )
         return result[in_window].reset_index(drop=True)
 
-    @staticmethod
-    def _week_num_sat_fri(dates: pd.Series) -> pd.Series:
-        """计算周数，每周定义为周六至周五，从1开始。"""
-        result = pd.Series(0, index=dates.index, dtype=int)
-        for year in dates.dt.year.unique():
-            mask = dates.dt.year == year
-            jan1 = pd.Timestamp(year, 1, 1)
-            first_sat = jan1 + pd.Timedelta(days=(5 - jan1.weekday()) % 7)
-            in_range = mask & (dates >= first_sat)
-            result[in_range] = ((dates[in_range] - first_sat).dt.days // 7 + 1).astype(int)
-        return result
+
+    ARRIVAL_PHASE_ORDER = ["靠泊", "锚泊", "在途 ETA", "估算到港"]
+    ARRIVAL_SOURCE_TO_PHASE = {
+        "atBerthA": "靠泊", "atBerthArrival": "靠泊",
+        "atAnchorA": "锚泊", "atAnchorArrival": "锚泊",
+        "etbStd": "在途 ETA", "etb": "在途 ETA",
+        "etaStd": "在途 ETA", "eta": "在途 ETA",
+        "estimated": "估算到港",
+    }
 
     def get_quantity_statistics(
             self,
@@ -186,8 +155,9 @@ class Present:
             expected_shipping_days: "int | None" = None,
             sheet_name=None,
             quantity_col: str = "quantity",
-            arrival_source_choices: "str | list[str]" = "all",
-            status_choices: "str | list[str]" = "all",
+            arrival_source_filter: "str | list[str] | None" = None,
+            status_filter: "str | list[str] | None" = None,
+            outdated_eliminate_window: "int | None" = 90,
         ):
         """统计各年/月/周的装运量。
 
@@ -198,13 +168,19 @@ class Present:
             expected_shipping_days: 估算航程天数，None 时不估算。
             sheet_name: 工作表名。
             quantity_col: 装运量列名，默认 "quantity"。
-            arrival_source_choices: 到港来源筛选，"all" 不过滤，否则按指定值过滤。
-            status_choices: 状态筛选，"all" 不过滤，否则按指定值过滤。
+            arrival_source_filter: 到港来源筛选，None 不过滤，否则按指定值过滤。
+            status_filter: 状态筛选，None 不过滤，否则按指定值过滤。
+            outdated_eliminate_window: 航程超窗剔除天数，见
+                combine_initial_vessel_sheet_with_query_result；None 或 <=0 不过滤。
 
         Returns:
-            df: 带有 arrival_month 和 arrival_week 列的业务行。
-            monthly: {year: DataFrame} 按月 groupby sum 的 quantity，无数据月份补0。
-            weekly: {year: DataFrame} 按周 groupby sum 的 quantity，无数据周补0。
+            df: 业务行，仅含 query_vessel_name / mmsi /
+                departure_from_origin_port / port / quantity / status /
+                port_name_en / port_name_cn / arrival_time / departure_time /
+                arrival_source / phase / cal_year / cal_month /
+                week_year / week_num（有则保留）。
+                汇总请对返回值再调 sum_by_phase，例如
+                sum_by_phase(df, "cal_year", "cal_month")。
         """
         if start and end:
             pass
@@ -216,59 +192,84 @@ class Present:
 
         if start and end:
             df = self.combine_initial_vessel_sheet_with_query_result(
-                start, end, expected_shipping_days, sheet_name
+                start, end, expected_shipping_days, sheet_name,
+                outdated_eliminate_window=outdated_eliminate_window,
             )
-            years = sorted(df["arrival_time"].dt.year.dropna().unique().astype(int))
         else:
             if isinstance(years, int):
                 years = [years]
             start = f"{min(years)}-01-01"
             end = f"{max(years)}-12-31"
             df = self.combine_initial_vessel_sheet_with_query_result(
-                start, end, expected_shipping_days, sheet_name
+                start, end, expected_shipping_days, sheet_name,
+                outdated_eliminate_window=outdated_eliminate_window,
             )
-        if arrival_source_choices != "all":
-            if isinstance(arrival_source_choices, str):
-                arrival_source_choices = [arrival_source_choices]
-            df = df[df["arrival_source"].isin(arrival_source_choices)]
-        if status_choices != "all":
-            if isinstance(status_choices, str):
-                status_choices = [status_choices]
-            df = df[df["status"].isin(status_choices)]
+        if arrival_source_filter is not None:
+            if isinstance(arrival_source_filter, str):
+                arrival_source_filter = [arrival_source_filter]
+            if "arrival_source" in df.columns:
+                df = df[df["arrival_source"].isin(arrival_source_filter)]
+        if status_filter is not None:
+            if isinstance(status_filter, str):
+                status_filter = [status_filter]
+            if "status" in df.columns:
+                df = df[df["status"].isin(status_filter)]
+
         df = df.copy()
-        df["arrival_month"] = df["arrival_time"].dt.month
-        df["arrival_week"] = self._week_num_sat_fri(df["arrival_time"])
+        if quantity_col in df.columns:
+            df[quantity_col] = pd.to_numeric(
+                df[quantity_col].astype(str).str.replace(",", "", regex=False).str.strip(),
+                errors="coerce",
+            ).fillna(0.0)
+        df = Tool.ensure_columns(df, {
+            "arrival_time": "datetime64[ns]",
+            "arrival_source": "object",
+        })
 
-        def _sum(series):
-            return pd.to_numeric(
-                series.astype(str).str.replace(",", ""), errors="coerce"
-            ).sum()
+        df["cal_year"] = df["arrival_time"].dt.year
+        df["cal_month"] = df["arrival_time"].dt.month
 
-        monthly = {}
-        weekly = {}
-        for year in years:
-            mask = df["arrival_time"].dt.year == year
-            df_year = df.loc[mask]
+        labels = Tool.calculate_week_number(df["arrival_time"])
+        df["week_year"] = labels["week_year"]
+        df["week_num"] = labels["week_num"]
+        df["week_start"] = labels["week_start"]
+        df["week_end"] = labels["week_end"]
 
-            m = df_year.groupby("arrival_month").agg(
-                quantity_sum=(quantity_col, _sum)
-            ).reindex(range(1, 13), fill_value=0).reset_index()
-            monthly[year] = m
+        df["phase"] = df["arrival_source"].map(self.ARRIVAL_SOURCE_TO_PHASE)
 
-            max_week = int(df_year["arrival_week"].max()) if not df_year.empty else 0
-            w = df_year.groupby("arrival_week").agg(
-                quantity_sum=(quantity_col, _sum)
-            ).reindex(range(1, max_week + 1), fill_value=0).reset_index()
-            weekly[year] = w
+        keep = [
+            "query_vessel_name", "mmsi", "departure_from_origin_port", "port",
+            "quantity", "status", "port_name_en", "port_name_cn",
+            "arrival_time", "departure_time", "arrival_source", "phase",
+            "cal_year", "cal_month", "week_year", "week_num",
+        ]
+        return df[[c for c in keep if c in df.columns]]
 
-        return df, monthly, weekly
+    @staticmethod
+    def sum_by_phase(
+        df: pd.DataFrame,
+        *by: str,
+        quantity_col: str = "quantity",
+    ) -> pd.DataFrame:
+        """按 by + phase 汇总 quantity，返回 [by..., phase, quantity_sum]。
+
+        不补缺失格子；画图时 pivot/reindex(fill_value=0) 自行补齐。
+        """
+        cols = [*by, "phase", "quantity_sum"]
+        if quantity_col not in df.columns or "phase" not in df.columns:
+            return pd.DataFrame(columns=cols)
+        return (
+            df.groupby([*by, "phase"], dropna=False)[quantity_col]
+            .sum()
+            .reset_index(name="quantity_sum")
+        )
 
     @property
     def route(self) -> "folium.Map":
         """把各船轨迹画在 folium 地图上 (实现已拆到 :class:`~VesselProcessAPI.Map.Map`)。
 
-        传入 Present 初始化得到的 returns_by_mmsi; 调用方式保持不变,
+        Map 自读 Store 全量分片; 调用方式保持不变,
         如 ``Present().route.save("map.html")``。
         """
         from .Map import Map  # 局部导入避免包初始化循环
-        return Map(self._returns_by_mmsi).route
+        return Map().route

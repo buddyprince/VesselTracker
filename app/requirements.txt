@@ -1,0 +1,7 @@
+streamlit>=1.57
+pandas>=2.0
+folium>=0.16
+branca>=0.7
+openpyxl>=3.1
+requests>=2.31
+altair>=5.0

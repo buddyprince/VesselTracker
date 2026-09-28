@@ -219,7 +219,6 @@ def _gqs_multi(
     expected_shipping_days=None,
     sheet_name=None,
     status_filter=None,
-    outdated_eliminate_window=90,
 ):
     """单表或多表调 get_quantity_statistics，汇总后返回 (df, monthly, weekly)。
 
@@ -235,7 +234,6 @@ def _gqs_multi(
                 expected_shipping_days=days,
                 sheet_name=sn,
                 status_filter=status_filter,
-                outdated_eliminate_window=outdated_eliminate_window,
             )
             for sn, days in sheet_days.items()
         ]
@@ -249,7 +247,6 @@ def _gqs_multi(
             expected_shipping_days=expected_shipping_days,
             sheet_name=sheet_name,
             status_filter=status_filter,
-            outdated_eliminate_window=outdated_eliminate_window,
         )
     if df.empty or "quantity" not in df.columns:
         return df, pd.DataFrame(), pd.DataFrame()
@@ -262,7 +259,6 @@ def _get_arrival_df_for_chart(
     sheet_configs,
     expected_shipping_days=None, sheet_name=None,
     start_date="1900-01-01", end_date="2100-01-01",
-    outdated_eliminate_window=90,
 ):
     """返回 (明细 df, monthly 长表, weekly 长表)；多 sheet 时先拼明细再统一汇总。"""
     if sheet_configs is not None:
@@ -274,7 +270,6 @@ def _get_arrival_df_for_chart(
             start_date, end_date,
             sheet_days=sheet_days,
             status_filter="unique",
-            outdated_eliminate_window=outdated_eliminate_window,
         )
     else:
         combined, monthly, weekly = _gqs_multi(
@@ -282,7 +277,6 @@ def _get_arrival_df_for_chart(
             expected_shipping_days=expected_shipping_days,
             sheet_name=sheet_name,
             status_filter="unique",
-            outdated_eliminate_window=outdated_eliminate_window,
         )
     if combined.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -609,22 +603,14 @@ with tab_track:
             st.session_state["track_exp_days"] = ORIGIN_DEFAULT_DAYS
             st.session_state["_prev_track_sheet"] = track_name
         with st.expander("航程天数设置"):
-            _track_exp_col, _track_win_col = st.columns(2)
-            with _track_exp_col:
-                expected_shipping_days = st.number_input(
-                    "航程天数", min_value=0, key="track_exp_days",
-                    help=(
-                        "全部时按各表默认航程天数计算（美湾60/美西25/巴西48/阿根廷60）"
-                        if _is_all_track else "在日期列基础上加的天数"
-                    ),
-                    disabled=_is_all_track,
-                )
-            with _track_win_col:
-                outdated_eliminate_window = st.number_input(
-                    "航程超窗剔除（天）",
-                    min_value=0, value=90, key="track_outdated_window",
-                    help="原始离港到到港超过该天数则剔除；0 表示不过滤",
-                ) or None
+            expected_shipping_days = st.number_input(
+                "航程天数", min_value=0, key="track_exp_days",
+                help=(
+                    "全部时按各表默认航程天数计算（美湾60/美西25/巴西48/阿根廷60）"
+                    if _is_all_track else "在日期列基础上加的天数"
+                ),
+                disabled=_is_all_track,
+            )
         if _is_all_track:
             valid_mmsi = sorted({
                 m
@@ -771,14 +757,12 @@ with tab_track:
                     combined = _gqs_multi(
                         str(start_date), str(end_date),
                         sheet_days=sheet_days,
-                        outdated_eliminate_window=outdated_eliminate_window,
                     )[0]
                 else:
                     combined = _gqs_multi(
                         str(start_date), str(end_date),
                         expected_shipping_days=expected_shipping_days,
                         sheet_name=track_name,
-                        outdated_eliminate_window=outdated_eliminate_window,
                     )[0]
                 if combined.empty:
                     current = pd.DataFrame()
@@ -788,7 +772,7 @@ with tab_track:
                         if "mmsi" in combined.columns else set()
                     )
                     current = present.current_situation
-                    if mmsis and "mmsi" in current.columns:
+                    if "mmsi" in current.columns:
                         current = current[
                             current["mmsi"].astype(str).isin(mmsis)
                         ].reset_index(drop=True)
@@ -972,19 +956,11 @@ with tab_chart:
             st.session_state["chart_exp_days"] = ORIGIN_DEFAULT_DAYS_C
             st.session_state["_prev_chart_sheet"] = chart_sheet_name
         with st.expander("航程天数设置"):
-            _chart_exp_col, _chart_win_col = st.columns(2)
-            with _chart_exp_col:
-                chart_exp_days = st.number_input(
-                    "航程天数", min_value=0, key="chart_exp_days",
-                    help="在日期列基础上加的天数",
-                    disabled=_is_all_sheets,
-                )
-            with _chart_win_col:
-                chart_outdated_window = st.number_input(
-                    "航程超窗剔除（天）",
-                    min_value=0, value=90, key="chart_outdated_window",
-                    help="原始离港到到港超过该天数则剔除；0 表示不过滤",
-                ) or None
+            chart_exp_days = st.number_input(
+                "航程天数", min_value=0, key="chart_exp_days",
+                help="在日期列基础上加的天数",
+                disabled=_is_all_sheets,
+            )
         if chart_sheet_name == "全部":
             all_mmsis = set()
             for sn in chart_sheets:
@@ -1015,7 +991,6 @@ with tab_chart:
         arrival_df, monthly_agg, weekly_agg = _get_arrival_df_for_chart(
             _sheet_configs,
             chart_exp_days, chart_sheet_name if not _is_all_sheets else None,
-            outdated_eliminate_window=chart_outdated_window,
         )
 
         with chart_sub_time:
@@ -1474,7 +1449,7 @@ with sub_data:
                     "配票时只接受 0 < 到港−离港 ≤ 该天数的挂靠；"
                     "超窗挂靠不消费，留给离港更晚的票。"
                     "0=不限制。改动后自动重算配票缓存。"
-                    "与跟踪/图表页「航程超窗剔除」独立（后者只过滤查询结果）。"
+                    "查询/图表页不再单独做航程超窗剔除，数据质量以本设置为准。"
                 ),
             )
         with dep_col:

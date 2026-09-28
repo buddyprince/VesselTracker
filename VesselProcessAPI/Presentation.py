@@ -71,11 +71,10 @@ class Present:
             end: str,
             expected_shipping_days: "int | None" = None,
             sheet_name=None,
-            outdated_eliminate_window: "int | None" = 90,
         ):
         """读取缓存的配票结果，补算 estimated arrival_time，返回窗口内命中的业务行。
 
-        流程: 读取缓存 -> 补算 estimated arrival_time -> 航程超窗过滤 -> 窗口过滤。
+        流程: 读取缓存 -> 补算 estimated arrival_time -> 窗口过滤 -> 保留 not_found 行。
         缓存格式: ``{"updated_at": ISO时间戳, "items": {... 按 sheet_name 分键 ...}}``。
 
         Args:
@@ -83,11 +82,9 @@ class Present:
             end: 统计窗口截止日期。
             expected_shipping_days: 估算航程天数，None 时不估算。
             sheet_name: 工作表名，用于从缓存中读取对应 sheet 的配票。None 时向兼容平铺格式。
-            outdated_eliminate_window: 原始离港到到港超过该天数则剔除；None 或
-                <=0 不过滤。默认 90 天。
 
         Returns:
-            窗口内命中的业务行。
+            窗口内命中的业务行，外加全部 not_found 船名行（arrival_time 为 NaT）。
         """
         start_ts = pd.Timestamp(start).normalize()
         end_ts = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)
@@ -116,26 +113,19 @@ class Present:
                 + pd.Timedelta(days=expected_shipping_days)
             )
 
-        # 航程超窗剔除: arrival_time - departure_from_origin_port > N 天
-        if outdated_eliminate_window and outdated_eliminate_window > 0:
-            if (
-                "arrival_time" in result.columns
-                and "departure_from_origin_port" in result.columns
-            ):
-                voyage_days = (
-                    result["arrival_time"] - result["departure_from_origin_port"]
-                ).dt.days
-                not_outdated = voyage_days.le(int(outdated_eliminate_window))
-                # 只剔除明确超窗的, NaT 保留
-                not_outdated = not_outdated | voyage_days.isna()
-                result = result[not_outdated]
-
         # 窗口过滤
         in_window = (
             result["arrival_time"].ge(start_ts)
             & result["arrival_time"].lt(end_ts)
         )
-        return result[in_window].reset_index(drop=True)
+        windowed = result[in_window]
+        # not_found 无 mmsi, 配票时被 groupby(mmsi) 跳过, arrival_time 恒为
+        # NaT, 永远进不了窗口; 按口径始终保留, 供"未匹配"指标与到港明细展示。
+        if "status" in result.columns:
+            unmatched = result[result["status"] == "not_found"]
+            if not unmatched.empty:
+                return pd.concat([windowed, unmatched], ignore_index=True)
+        return windowed.reset_index(drop=True)
 
 
     ARRIVAL_PHASE_ORDER = ["靠泊", "锚泊", "在途 ETA", "估算到港"]
@@ -157,7 +147,6 @@ class Present:
             quantity_col: str = "quantity",
             arrival_source_filter: "str | list[str] | None" = None,
             status_filter: "str | list[str] | None" = None,
-            outdated_eliminate_window: "int | None" = 90,
         ):
         """统计各年/月/周的装运量。
 
@@ -170,8 +159,6 @@ class Present:
             quantity_col: 装运量列名，默认 "quantity"。
             arrival_source_filter: 到港来源筛选，None 不过滤，否则按指定值过滤。
             status_filter: 状态筛选，None 不过滤，否则按指定值过滤。
-            outdated_eliminate_window: 航程超窗剔除天数，见
-                combine_initial_vessel_sheet_with_query_result；None 或 <=0 不过滤。
 
         Returns:
             df: 业务行，仅含 query_vessel_name / mmsi /
@@ -193,7 +180,6 @@ class Present:
         if start and end:
             df = self.combine_initial_vessel_sheet_with_query_result(
                 start, end, expected_shipping_days, sheet_name,
-                outdated_eliminate_window=outdated_eliminate_window,
             )
         else:
             if isinstance(years, int):
@@ -202,7 +188,6 @@ class Present:
             end = f"{max(years)}-12-31"
             df = self.combine_initial_vessel_sheet_with_query_result(
                 start, end, expected_shipping_days, sheet_name,
-                outdated_eliminate_window=outdated_eliminate_window,
             )
         if arrival_source_filter is not None:
             if isinstance(arrival_source_filter, str):

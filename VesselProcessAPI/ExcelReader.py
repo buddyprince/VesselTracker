@@ -146,7 +146,7 @@ class Brazil:
         df = Brazil._merge_voyage(df)
         # 合并之后按组状态过滤, 并丢弃透传用的 status / cargoes 两列
         out = df.loc[df["status"] == "SAILED"]
-        return out.drop(columns=["status", "cargoes"]).reset_index(drop=True)
+        return out.drop(columns=["status", "cargoes",'order']).reset_index(drop=True)
 
     # ---------------------------------------------------------------- 单表解析
 

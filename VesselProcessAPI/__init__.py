@@ -4,6 +4,7 @@ from .Map import Map
 from .Store import Store
 from .MatchTicket import MatchTicket
 from .Tool import Tool
+from .ExcelReader import ExcelReader
 
 __all__ = [
     FreightowerAPI,
@@ -12,4 +13,5 @@ __all__ = [
     Store,
     MatchTicket,
     Tool,
+    ExcelReader,
 ]

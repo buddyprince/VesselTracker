@@ -1,7 +1,6 @@
 """MatchTicket: 归一化原始数据，实现配票逻辑。"""
 
 import json
-from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -9,6 +8,7 @@ import pandas as pd
 from .JsonOperation import JsonOperation
 from .Store import Store
 from .Tool import Tool
+from .paths_config import MATCH_TICKETS_DIR
 
 
 class MatchTicket:
@@ -32,7 +32,7 @@ class MatchTicket:
             save_returns: 存档目录路径，默认包内 .json/.saved_returns。
         """
         self._store = Store(save_returns) if save_returns else Store()
-        self._io = JsonOperation(Path(__file__).with_name(".json") / ".match_tickets")
+        self._io = JsonOperation(MATCH_TICKETS_DIR)
 
     # ── 缓存读写 ────────────────────────────
 

@@ -9,6 +9,7 @@ if TYPE_CHECKING:  # 仅类型检查时导入, 运行时不执行, 切断循环
 from .MatchTicket import MatchTicket
 from .Store import Store
 from .Tool import Tool
+from .paths_config import MATCHED_TICKETS_FILE
 
 
 class Present:
@@ -28,9 +29,7 @@ class Present:
         if matched_tickets_with_port_calls is not None:
             self._matched_tickets_path = Path(matched_tickets_with_port_calls)
         else:
-            self._matched_tickets_path = (
-                Path(__file__).with_name(".json") / ".match_tickets" / ".matched_tickets_with_port_calls.json"
-            )
+            self._matched_tickets_path = MATCHED_TICKETS_FILE
 
     @property
     def get_vessel_info_df(self) -> pd.DataFrame:

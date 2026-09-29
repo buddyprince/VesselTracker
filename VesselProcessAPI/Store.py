@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .JsonOperation import JsonOperation
+from .paths_config import SAVED_RETURNS_DIR
 
 
 class Store:
@@ -29,8 +30,7 @@ class Store:
     DATE_FMT = "%Y-%m-%d %H:%M:%S"
 
     def __init__(self, root: "str | Path | None" = None) -> None:
-        self.root = (Path(root) if root
-                     else Path(__file__).with_name(".json") / ".saved_returns")
+        self.root = Path(root) if root else SAVED_RETURNS_DIR
         self._io = JsonOperation(self.root)
 
     @staticmethod

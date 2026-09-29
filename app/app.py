@@ -804,12 +804,11 @@ with tab_track:
                         if "status" in by_name.columns else by_name
                     )
 
-                    a1, a2, a3, a4 = st.columns(4)
+                    a1, a2, a3 = st.columns(3)
                     a1.metric(
                         "窗口内查询船数", n_names,
                         help=(f"首次靠泊 {st.session_state.arrival_country} 的时间落在 "
-                              f"{start_date} ~ {end_date} 内的 unique/multiple 船，"
-                              f"另含全部 not_found 船名"),
+                              f"{start_date} ~ {end_date} 内的 unique/multiple 船"),
                     )
                     a2.metric(
                         "唯一匹配 unique", n_unique,
@@ -823,10 +822,6 @@ with tab_track:
                               "请在 MMSI 查询页核实并改为 unique。"
                               + (f"涉及：{', '.join(multi_names)}"
                                  if multi_names else "")),
-                    )
-                    a4.metric(
-                        "未匹配", n_names - n_unique - n_multiple,
-                        help="not_found 船名：无 MMSI，始终保留在结果中",
                     )
 
                     st.markdown(f"**窗口内唯一匹配（unique）：共 {len(uniq_names)} 艘**")

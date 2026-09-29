@@ -8,6 +8,7 @@ import folium
 import requests
 
 from .Store import Store
+from .paths_config import WORLD_COUNTRIES_CACHE, WORLD_PORTS_CACHE
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ class Map:
 
     def _world_ports(self) -> dict[str, dict[str, tuple[float, float]]]:
         """读取 searoute-py 全球港口缓存; 无缓存或旧缓存时下载并缓存。"""
-        cache = Path(__file__).with_name(".json") / ".world_ports.json"
+        cache = WORLD_PORTS_CACHE
         version = "searoute-ports-1.6.0"
         try:
             data = json.loads(cache.read_text(encoding="utf-8"))
@@ -118,7 +119,7 @@ class Map:
             "</div>"))
         # 国境线: 优先读包内缓存, 无缓存或损坏时联网下载并缓存; 失败仅告警不影响出图
         border = None
-        cache = Path(__file__).with_name(".json") / ".world_countries.json"
+        cache = WORLD_COUNTRIES_CACHE
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))
             if cached.get("features"):

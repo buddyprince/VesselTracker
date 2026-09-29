@@ -1,0 +1,8 @@
+# 本地存档/缓存数据: Store 存档、配票缓存、API token、地图缓存
+.json/
+
+# Python
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ipynb_checkpoints/

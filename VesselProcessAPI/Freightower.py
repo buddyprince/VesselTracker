@@ -5,11 +5,11 @@ import re
 import time
 import webbrowser
 from datetime import datetime, timedelta
-from pathlib import Path
 import pandas as pd
 import requests
 from .Presentation import Present
 from .Store import Store
+from .paths_config import TOKEN_FILE
 
 log = logging.getLogger(__name__)
 
@@ -108,7 +108,7 @@ class FreightowerAPI:
         Raises:
             TimeoutError: 超时仍未确认。
         """
-        token_file = Path(__file__).with_name(".json") / ".freightower_token.json"
+        token_file = TOKEN_FILE
         if not force:  # 优先读本地 token, 校验失效后继续扫码
             try:
                 token = json.loads(token_file.read_text(encoding="utf-8"))["access_token"]

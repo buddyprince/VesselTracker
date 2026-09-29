@@ -74,7 +74,7 @@ class Present:
         ):
         """读取缓存的配票结果，补算 estimated arrival_time，返回窗口内命中的业务行。
 
-        流程: 读取缓存 -> 补算 estimated arrival_time -> 窗口过滤 -> 保留 not_found 行。
+        流程: 读取缓存 -> 补算 estimated arrival_time -> 窗口过滤。
         缓存格式: ``{"updated_at": ISO时间戳, "items": {... 按 sheet_name 分键 ...}}``。
 
         Args:
@@ -84,7 +84,7 @@ class Present:
             sheet_name: 工作表名，用于从缓存中读取对应 sheet 的配票。None 时向兼容平铺格式。
 
         Returns:
-            窗口内命中的业务行，外加全部 not_found 船名行（arrival_time 为 NaT）。
+            窗口内命中的业务行。
         """
         start_ts = pd.Timestamp(start).normalize()
         end_ts = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)
@@ -118,14 +118,7 @@ class Present:
             result["arrival_time"].ge(start_ts)
             & result["arrival_time"].lt(end_ts)
         )
-        windowed = result[in_window]
-        # not_found 无 mmsi, 配票时被 groupby(mmsi) 跳过, arrival_time 恒为
-        # NaT, 永远进不了窗口; 按口径始终保留, 供"未匹配"指标与到港明细展示。
-        if "status" in result.columns:
-            unmatched = result[result["status"] == "not_found"]
-            if not unmatched.empty:
-                return pd.concat([windowed, unmatched], ignore_index=True)
-        return windowed.reset_index(drop=True)
+        return result[in_window].reset_index(drop=True)
 
 
     ARRIVAL_PHASE_ORDER = ["靠泊", "锚泊", "在途 ETA", "估算到港"]

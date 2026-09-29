@@ -772,7 +772,7 @@ with tab_track:
                         if "mmsi" in combined.columns else set()
                     )
                     current = present.current_situation
-                    if "mmsi" in current.columns:
+                    if mmsis and "mmsi" in current.columns:
                         current = current[
                             current["mmsi"].astype(str).isin(mmsis)
                         ].reset_index(drop=True)
